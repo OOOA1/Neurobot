@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # services/providers/veo.py
 import aiohttp
 import logging
