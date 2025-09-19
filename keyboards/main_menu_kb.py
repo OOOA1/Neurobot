@@ -2,6 +2,7 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -13,10 +14,12 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
+
 def back_to_main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="Назад", callback_data="menu:back"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back"))
     return builder.as_markup()
+
 
 def video_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -24,5 +27,13 @@ def video_menu_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🎬 Veo3", callback_data="menu:video:veo"),
         InlineKeyboardButton(text="✂️ Luma", callback_data="menu:video:luma"),
     )
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back"))
+    return builder.as_markup()
+
+
+def balance_kb_placeholder() -> InlineKeyboardMarkup:
+    """Клавиатура баланса с заглушкой пополнения."""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="➕ Пополнить", callback_data="balance:topup"))
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back"))
     return builder.as_markup()
