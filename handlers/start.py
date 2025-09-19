@@ -6,13 +6,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from config import settings
-from db import _prepare, connect, ensure_user, get_user_balance, GENERATION_COST_TOKENS
+from db import _prepare, connect, ensure_user
 from handlers.video import start_veo_wizard, start_luma_wizard
 from keyboards.main_menu_kb import (
     back_to_main_menu_kb,
     main_menu_kb,
     video_menu_kb,
-    balance_kb_placeholder,
 )
 from texts import HELP, WELCOME
 
@@ -64,9 +63,20 @@ async def _edit_video_menu(message: Message) -> None:
 
 @router.message(CommandStart())
 async def cmd_start(msg: Message) -> None:
+    """
+    Обязательно регистрируем пользователя и показываем главное меню.
+    Если /start пришёл с payload (deep-link от рефералки) — пока игнорируем (заглушка).
+    """
     async with connect() as db:
         await _prepare(db)
         await ensure_user(db, msg.from_user.id, msg.from_user.username, settings.FREE_TOKENS_ON_JOIN)
+
+    # Deep link payload (заглушка — без записи в БД)
+    # Пример текста: "/start 123456789" или "/start"
+    # payload можно разобрать при необходимости:
+    # parts = (msg.text or "").split(maxsplit=1)
+    # referrer = parts[1] if len(parts) > 1 else None
+
     await _send_main_menu(msg)
 
 
@@ -103,44 +113,6 @@ async def menu_video_luma(cb: CallbackQuery, state: FSMContext) -> None:
     if not cb.message:
         return
     await start_luma_wizard(cb.message, state)
-
-
-@router.callback_query(F.data == "menu:balance")
-async def menu_balance(cb: CallbackQuery) -> None:
-    await cb.answer()
-    if not cb.message:
-        return
-    async with connect() as db:
-        await _prepare(db)
-        balance = await get_user_balance(db, cb.from_user.id)
-    text = (
-        f"Баланс токенов: {balance}\n\n"
-        f"Стоимость генерации видео: {GENERATION_COST_TOKENS} токена.\n"
-        f"Нажмите «Пополнить», чтобы увеличить баланс (заглушка)."
-    )
-    try:
-        await cb.message.edit_text(text, reply_markup=balance_kb_placeholder())
-    except TelegramBadRequest as exc:
-        if not _is_not_modified_error(exc):
-            raise
-
-
-@router.callback_query(F.data == "balance:topup")
-async def balance_topup_placeholder(cb: CallbackQuery) -> None:
-    await cb.answer()
-    if not cb.message:
-        return
-    # Заглушка — здесь позже будет реальная платёжка
-    text = (
-        "Пополнение баланса (заглушка).\n\n"
-        "В одной из следующих версий здесь появится окно оплаты.\n"
-        "Пока что вернитесь назад."
-    )
-    try:
-        await cb.message.edit_text(text, reply_markup=back_to_main_menu_kb())
-    except TelegramBadRequest as exc:
-        if not _is_not_modified_error(exc):
-            raise
 
 
 @router.callback_query(F.data == "menu:help")

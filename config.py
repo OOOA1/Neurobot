@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from typing import Set
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -34,6 +35,19 @@ class Settings(BaseModel):
 
     TEXT_BLOCK_SCORE: float = float(os.getenv("TEXT_BLOCK_SCORE", 0.8))
     TEXT_SOFT_SCORE: float = float(os.getenv("TEXT_SOFT_SCORE", 0.6))
+
+    # --------- Новые настройки ---------
+    ADMIN_USER_IDS: str = os.getenv("ADMIN_USER_IDS", "")
+    BOT_USERNAME: str = os.getenv("BOT_USERNAME", "")
+    PROMO_TTL_HOURS: int = int(os.getenv("PROMO_TTL_HOURS", 3))  # TTL многоразовых промокодов (часы)
+
+    def admin_ids(self) -> Set[int]:
+        raw = (self.ADMIN_USER_IDS or "").replace(" ", "")
+        return {int(x) for x in raw.split(",") if x.isdigit()}
+
+    def bot_username_clean(self) -> str:
+        """Возвращает username бота без @ в начале."""
+        return self.BOT_USERNAME.lstrip("@") if self.BOT_USERNAME else ""
 
 
 settings = Settings()

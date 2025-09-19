@@ -41,6 +41,15 @@ router = Router()
 log = logging.getLogger(__name__)
 
 
+# -------- admin helpers --------
+def _is_admin(user_id: int) -> bool:
+    try:
+        return user_id in settings.admin_ids()
+    except Exception:
+        raw = (getattr(settings, "ADMIN_USER_IDS", "") or "").replace(" ", "")
+        return str(user_id) in {x for x in raw.split(",") if x}
+
+
 class VeoWizardStates(StatesGroup):
     summary = State()
     prompt_input = State()
@@ -188,14 +197,6 @@ async def start_veo_wizard(msg: Message, state: FSMContext) -> None:
     await _ensure_summary_message(msg, state)
 
 
-@router.callback_query(F.data == "menu:video")
-async def menu_entry(cb: CallbackQuery, state: FSMContext) -> None:
-    await cb.answer()
-    if not cb.message:
-        return
-    await start_veo_wizard(cb.message, state)
-
-
 @router.message(Command("veo"))
 async def cmd_veo(msg: Message, state: FSMContext) -> None:
     await start_veo_wizard(msg, state)
@@ -273,23 +274,28 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         negative_prompt = (data.get("negative_text") or None) if data.get("negative_enabled") else None
         resolution_value = int(str(resolution).rstrip("p"))
 
+        # Billing: админов не трогаем
+        is_admin = _is_admin(cb.from_user.id)
+
         # 1) Баланс
-        async with connect() as db:
-            await _prepare(db)
-            bal = await get_user_balance(db, cb.from_user.id)
-        if bal < GENERATION_COST_TOKENS:
-            await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
-            await cb.answer()
-            return
+        if not is_admin:
+            async with connect() as db:
+                await _prepare(db)
+                bal = await get_user_balance(db, cb.from_user.id)
+            if bal < GENERATION_COST_TOKENS:
+                await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
+                await cb.answer()
+                return
 
         # 2) Списываем токены (атомарно)
-        async with connect() as db:
-            await _prepare(db)
-            charged = await charge_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
-        if not charged:
-            await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
-            await cb.answer()
-            return
+        if not is_admin:
+            async with connect() as db:
+                await _prepare(db)
+                charged = await charge_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+            if not charged:
+                await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
+                await cb.answer()
+                return
 
         await cb.answer("Генерация запущена")
         status_message = await message.answer("Генерация началась")
@@ -305,10 +311,11 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 reference_file_id=data.get("reference_file_id"),
             )
         except Exception as exc:
-            # провайдер не принял задачу — вернём токены
-            async with connect() as db:
-                await _prepare(db)
-                await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+            # провайдер не принял задачу — вернём токены (если не админ)
+            if not is_admin:
+                async with connect() as db:
+                    await _prepare(db)
+                    await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
 
             log.exception("Veo3 submit failed: %s", exc)
             text = str(exc).lower()
@@ -332,10 +339,11 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 break
 
             if status.status == "failed":
-                # финальный провал — возвращаем токены
-                async with connect() as db:
-                    await _prepare(db)
-                    await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+                # финальный провал — возвращаем токены (если не админ)
+                if not is_admin:
+                    async with connect() as db:
+                        await _prepare(db)
+                        await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
                 failure_text = status.error or "Генерация завершилась с ошибкой"
                 break
 
@@ -349,10 +357,11 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                     video_path = await generation_service.download_video("veo3", job_id)
                 except Exception as exc:
                     log.exception("Veo3 download failed: %s", exc)
-                    # возврат токенов при невозможности получить результат
-                    async with connect() as db:
-                        await _prepare(db)
-                        await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+                    # возврат токенов при невозможности получить результат (если не админ)
+                    if not is_admin:
+                        async with connect() as db:
+                            await _prepare(db)
+                            await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
                     failure_text = "Не удалось скачать видео"
                     break
                 try:
@@ -479,7 +488,6 @@ async def _luma_get_summary_meta(state: FSMContext) -> dict[str, Any] | None:
 
 
 def _render_luma_summary(state: dict[str, Any]) -> str:
-    # версия без строки «Режим»
     prompt = state.get("prompt") or "—"
     video = "да" if state.get("video_file_id") else "нет"
     intensity = int(state.get("intensity") or 1)
@@ -585,11 +593,11 @@ async def luma_callback(cb: CallbackQuery, state: FSMContext) -> None:
         video_file_id = data.get("video_file_id")
         if video_file_id:
             if not prompt:
-                await cb.answer("Добавьте промт (для редактирования видео)", show_alert=True)
+                await cb.answer("Добавьте промпт (для редактирования видео)", show_alert=True)
                 return
         else:
             if not prompt:
-                await cb.answer("Добавьте промт (генерация по тексту)", show_alert=True)
+                await cb.answer("Добавьте промпт (генерация по тексту)", show_alert=True)
                 return
         await cb.answer("Запуск…")
         await _run_luma_generation(message, data)
@@ -651,21 +659,25 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
     intensity = int(data.get("intensity") or 1)
     mode = "edit" if video_file_id else "generate"
 
-    # 1) Баланс
-    async with connect() as db:
-        await _prepare(db)
-        bal = await get_user_balance(db, message.from_user.id)
-    if bal < GENERATION_COST_TOKENS:
-        await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
-        return
+    is_admin = _is_admin(message.from_user.id)
 
-    # 2) Списываем токены (атомарно)
-    async with connect() as db:
-        await _prepare(db)
-        charged = await charge_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
-    if not charged:
-        await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
-        return
+    # 1) Баланс (для не-админов)
+    if not is_admin:
+        async with connect() as db:
+            await _prepare(db)
+            bal = await get_user_balance(db, message.from_user.id)
+        if bal < GENERATION_COST_TOKENS:
+            await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
+            return
+
+    # 2) Списываем токены (для не-админов)
+    if not is_admin:
+        async with connect() as db:
+            await _prepare(db)
+            charged = await charge_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+        if not charged:
+            await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
+            return
 
     status_message = await message.answer("Генерация началась…")
     extras: dict[str, Any] = {"intensity": intensity}
@@ -699,8 +711,9 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
         async with connect() as db:
             await _prepare(db)
             await set_job_status(db, job_id, "failed")
-            # возврат токенов
-            await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+            # возврат токенов (если не админ)
+            if not is_admin:
+                await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
         return
 
     async with connect() as db:
@@ -719,9 +732,10 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
             break
 
         if status.status == "failed":
-            async with connect() as db:
-                await _prepare(db)
-                await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+            if not is_admin:
+                async with connect() as db:
+                    await _prepare(db)
+                    await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
             failure_text = status.error or "Luma не смогла завершить задачу"
             break
 
@@ -735,9 +749,10 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
                 video_path = await generation_service.download_job(Provider.LUMA, provider_job_id)
             except Exception as exc:
                 log.exception("Luma download failed: %s", exc)
-                async with connect() as db:
-                    await _prepare(db)
-                    await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+                if not is_admin:
+                    async with connect() as db:
+                        await _prepare(db)
+                        await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
                 failure_text = "Не удалось скачать видео"
                 break
             try:
