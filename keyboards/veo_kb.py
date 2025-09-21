@@ -8,19 +8,20 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 StateDict = Mapping[str, object]
 
+
 def _mark(label: str, *, selected: bool) -> str:
     return f"✅ {label}" if selected else label
+
 
 def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     prompt_present = bool(state.get("prompt"))
-    reference_present = bool(state.get("reference_file_id"))
+    reference_present = bool(state.get("reference_file_id") or state.get("reference_url"))
     ar = (state.get("ar") or "16:9").lower()
     mode = (state.get("mode") or "quality").lower()
-    resolution = (state.get("resolution") or "1080p").lower()
 
-    # ВАЖНО: даём value, которые ждёт handlers/video.py
+    # ВАЖНО: значения для AR с подчёркиванием (а не с двоеточием) — так ждут хендлеры
     builder.row(
         InlineKeyboardButton(
             text=_mark("🖼️ Референс", selected=reference_present),
@@ -32,7 +33,6 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
         ),
     )
 
-    # ВАЖНО: значения для AR с подчёркиванием (а не с двоеточием)
     builder.row(
         InlineKeyboardButton(
             text=_mark("16:9", selected=(ar == "16:9")),
@@ -44,16 +44,7 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
         ),
     )
 
-    builder.row(
-        InlineKeyboardButton(
-            text=_mark("720p", selected=(resolution == "720p")),
-            callback_data="veo:res:720p",
-        ),
-        InlineKeyboardButton(
-            text=_mark("1080p", selected=(resolution == "1080p")),
-            callback_data="veo:res:1080p",
-        ),
-    )
+    # Кнопки выбора разрешения (720p/1080p) удалены — теперь оно выбирается автоматически
 
     builder.row(
         InlineKeyboardButton(
@@ -75,3 +66,17 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
     )
 
     return builder.as_markup()
+
+
+def veo_post_gen_kb() -> InlineKeyboardMarkup:
+    """
+    Клавиатура, которая показывается под готовым видео:
+    - «Сгенерировать ещё» возвращает в Veo-мастер
+    - «Главное меню» возвращает в главное меню
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Сгенерировать ещё", callback_data="menu:video:veo")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:back")],
+        ]
+    )

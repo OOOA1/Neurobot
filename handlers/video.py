@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
+import tempfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+import asyncio
+import httpx
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -29,16 +31,27 @@ from db import (
     GENERATION_COST_TOKENS,
 )
 from keyboards.main_menu_kb import main_menu_kb, balance_kb_placeholder
-from keyboards.veo_kb import veo_options_kb
+from keyboards.veo_kb import veo_options_kb, veo_post_gen_kb
 from keyboards.luma_kb import luma_options_kb
 from providers.base import Provider
 from providers.models import GenerationParams
 from services import generation_service
 from services.moderation import check_text
-from texts import WELCOME, INSUFFICIENT_TOKENS, GENERATION_FAILED
+from services.media_tools import (
+    probe_video,
+    build_intro_from_image,
+    concat_with_crossfade,
+)
+from texts import WELCOME, INSUFFICIENT_TOKENS
 
 router = Router()
 log = logging.getLogger(__name__)
+
+
+# -------- admin helpers --------
+def _is_admin(user_id: int) -> bool:
+    """Единая проверка админа — строго через конфиг."""
+    return settings.is_admin(user_id)
 
 
 class VeoWizardStates(StatesGroup):
@@ -53,9 +66,10 @@ VEO_DEFAULT_STATE: dict[str, Any] = {
     "negative_enabled": False,
     "negative_text": None,
     "ar": "16:9",
-    "resolution": "720p",
+    # "resolution" убран — выбираем автоматически
     "mode": "quality",
-    "reference_file_id": None,
+    "reference_file_id": None,   # Telegram file_id фото-референса
+    "reference_url": None,       # кэшируем прямой URL для постпроцессинга
 }
 
 SUMMARY_META_KEY = "veo_summary_message"
@@ -97,21 +111,16 @@ async def _get_summary_meta(state: FSMContext) -> dict[str, Any] | None:
 def _render_summary(state: dict[str, Any]) -> str:
     prompt = state.get("prompt") or "—"
     aspect = state.get("ar") or "—"
-    resolution = state.get("resolution") or "720p"
     mode = (state.get("mode") or "quality").lower()
     mode_label = "Быстро" if mode == "fast" else "Качество"
-    negative_enabled = bool(state.get("negative_enabled"))
-    if negative_enabled and state.get("negative_text"):
-        neg_display = str(state.get("negative_text"))
-    else:
-        neg_display = "Выкл"
+    ref_present = "да" if state.get("reference_file_id") else "нет"
     lines = [
         "🎬 Veo3 генерация",
         f"Промт: {prompt}",
         f"Соотношение сторон: {aspect}",
-        f"Разрешение: {resolution}",
+        # строка «Разрешение» убрана
         f"Режим: {mode_label}",
-        f"Negative prompt: {neg_display}",
+        f"Референс: {ref_present}",
         "Настройте параметры кнопками ниже.",
     ]
     return "\n".join(lines)
@@ -188,17 +197,70 @@ async def start_veo_wizard(msg: Message, state: FSMContext) -> None:
     await _ensure_summary_message(msg, state)
 
 
-@router.callback_query(F.data == "menu:video")
-async def menu_entry(cb: CallbackQuery, state: FSMContext) -> None:
-    await cb.answer()
-    if not cb.message:
-        return
-    await start_veo_wizard(cb.message, state)
-
-
 @router.message(Command("veo"))
 async def cmd_veo(msg: Message, state: FSMContext) -> None:
     await start_veo_wizard(msg, state)
+
+
+async def _file_id_to_url(bot, file_id: str) -> str | None:
+    """
+    Превращаем Telegram file_id в прямой URL для скачивания:
+    это нужно для постпроцессинга (подкладываем фото первым кадром).
+    """
+    try:
+        tg_file = await bot.get_file(file_id)
+        file_path = tg_file.file_path
+        token = settings.BOT_TOKEN
+        if not token:
+            log.warning("BOT_TOKEN is not set; can't build file URL for reference image")
+            return None
+        return f"https://api.telegram.org/file/bot{token}/{file_path}"
+    except Exception as exc:
+        log.exception("Failed to resolve file_id to URL: %s", exc)
+        return None
+
+
+async def _stitch_if_needed(reference_url: str | None, video_path: Path) -> Path:
+    """
+    Если есть reference_url — делаем короткое интро из фото и кроссфейд к сгенерённому видео.
+    Возвращаем путь к склеенному видео (или исходному, если не удалось/не требуется).
+    """
+    if not reference_url:
+        return video_path
+
+    stitched_path: Path | None = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            img_path = td_path / "ref.jpg"
+            intro_path = td_path / "intro.mp4"
+            # грузим изображение
+            async with httpx.AsyncClient() as http:
+                resp = await http.get(reference_url, timeout=30.0)
+                resp.raise_for_status()
+                img_path.write_bytes(resp.content)
+            # параметры основного ролика
+            w, h, fps = probe_video(str(video_path))
+            # интро и склейка
+            await build_intro_from_image(
+                str(img_path),
+                str(intro_path),
+                width=w,
+                height=h,
+                duration=0.7,
+                fps=fps,
+            )
+            stitched_path = Path(video_path).with_name(Path(video_path).stem + "_ref.mp4")
+            await concat_with_crossfade(
+                str(intro_path),
+                str(video_path),
+                str(stitched_path),
+                fade_duration=0.35,
+            )
+        return stitched_path if stitched_path and stitched_path.exists() else video_path
+    except Exception as exc:
+        log.exception("Reference intro stitch failed: %s", exc)
+        return video_path
 
 
 @router.callback_query(F.data.startswith("veo:"))
@@ -223,12 +285,9 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             return
         await _edit_summary(message=message, bot=message.bot, state=state, data=data)
         return
+    # ветка выбора разрешения удалена (кнопка, если осталась в клавиатуре, будет игнорироваться)
     if action == "res":
-        current = data.get("resolution") or "720p"
-        new_value = "1080p" if current == "720p" else "720p"
-        data = await _update_data(state, resolution=new_value)
-        await cb.answer(f"Разрешение: {new_value}")
-        await _edit_summary(message=message, bot=message.bot, state=state, data=data)
+        await cb.answer()  # игнор
         return
     if action == "mode":
         if value in {"fast", "quality"}:
@@ -258,6 +317,11 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer("Пришлите изображение-референс")
         await state.set_state(VeoWizardStates.reference_input)
         return
+    if action == "ref" and value == "clear":
+        data = await _update_data(state, reference_file_id=None, reference_url=None)
+        await cb.answer("Референс удалён")
+        await _edit_summary(message=message, bot=message.bot, state=state, data=data)
+        return
     if action == "generate":
         prompt = (data.get("prompt") or "").strip()
         aspect = data.get("ar")
@@ -265,114 +329,186 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             await cb.answer("Укажите промт (✍️ Промт) и соотношение сторон (16:9 / 9:16)", show_alert=True)
             return
 
-        # авто-даунгрейд для 9:16 -> 720п
-        resolution = (data.get("resolution") or "720p").lower()
-        if aspect == "9:16" and resolution != "720p":
-            resolution = "720p"
+        # Определяем разрешение автоматически:
+        # - если есть референс ИЛИ аспект 9:16 → 720p
+        # - иначе → 1080p
+        reference_file_id = data.get("reference_file_id")
+        reference_url = data.get("reference_url")
+        has_reference = bool(reference_file_id or reference_url)
+        resolution_first = 720 if has_reference or aspect == "9:16" else 1080
+
+        # Режим и negative
         mode = (data.get("mode") or "quality").lower()
         negative_prompt = (data.get("negative_text") or None) if data.get("negative_enabled") else None
-        resolution_value = int(str(resolution).rstrip("p"))
+
+        # Billing: админов не трогаем
+        is_admin = _is_admin(cb.from_user.id)
+
+        # Гарантируем наличие пользователя (для новичков)
+        async with connect() as db:
+            await _prepare(db)
+            await ensure_user(db, cb.from_user.id, cb.from_user.username, settings.FREE_TOKENS_ON_JOIN)
 
         # 1) Баланс
-        async with connect() as db:
-            await _prepare(db)
-            bal = await get_user_balance(db, cb.from_user.id)
-        if bal < GENERATION_COST_TOKENS:
-            await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
-            await cb.answer()
-            return
+        if not is_admin:
+            async with connect() as db:
+                await _prepare(db)
+                bal = await get_user_balance(db, cb.from_user.id)
+            if bal < GENERATION_COST_TOKENS:
+                await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
+                await cb.answer()
+                return
 
-        # 2) Списываем токены (атомарно)
-        async with connect() as db:
-            await _prepare(db)
-            charged = await charge_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
-        if not charged:
-            await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
-            await cb.answer()
-            return
+        # 2) Списываем токены (атомарно, один раз)
+        if not is_admin:
+            async with connect() as db:
+                await _prepare(db)
+                charged = await charge_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+            if not charged:
+                await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
+                await cb.answer()
+                return
 
         await cb.answer("Генерация запущена")
         status_message = await message.answer("Генерация началась")
 
         try:
-            job_id = await generation_service.create_video(
+            ref_value = reference_url or reference_file_id or None
+
+            # Строгий режим только для «нестандартных» AR (вертикаль/квадрат)
+            strict = aspect in {"9:16", "1:1"}
+
+            # ---------- Первый рендер (auto 720/1080) ----------
+            job_id_first = await generation_service.create_video(
                 provider="veo3",
                 prompt=prompt,
                 aspect_ratio=aspect,
-                resolution=resolution_value,
+                resolution=resolution_first,
                 negative_prompt=negative_prompt,
                 fast=(mode == "fast"),
-                reference_file_id=data.get("reference_file_id"),
+                reference_file_id=ref_value,
+                strict_ar=strict,  # ключ к нативному AR
             )
         except Exception as exc:
-            # провайдер не принял задачу — вернём токены
-            async with connect() as db:
-                await _prepare(db)
-                await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+            if not is_admin:
+                async with connect() as db:
+                    await _prepare(db)
+                    await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
 
             log.exception("Veo3 submit failed: %s", exc)
             text = str(exc).lower()
             if "resource_exhausted" in text or "quota" in text or "rate limit" in text:
                 await status_message.edit_text(
                     "❗ Не удалось начать генерацию: превышен лимит/квота Gemini API.\n"
-                    "Попробуйте позже, включите оплату в Google AI Studio, либо переключите режим на Fast и 720p."
+                    "Попробуйте позже, включите оплату в Google AI Studio, либо переключите режим на Fast."
                 )
             else:
                 await status_message.edit_text("Не удалось начать генерацию")
             return
 
         poll_interval = max(3.0, settings.JOB_POLL_INTERVAL_SEC)
-        failure_text = None
-        while True:
-            try:
-                status = await generation_service.poll_video("veo3", job_id)
-            except Exception as exc:
-                log.exception("Veo3 poll failed: %s", exc)
-                failure_text = "Ошибка при получении статуса генерации"
-                break
 
-            if status.status == "failed":
-                # финальный провал — возвращаем токены
+        # Ожидаем завершения первого рендера
+        first_status = await generation_service.wait_for_completion(
+            Provider.VEO3, job_id_first, interval_sec=poll_interval, timeout_sec=max(60.0, settings.JOB_MAX_WAIT_MIN * 60)
+        )
+        if first_status.status != "succeeded":
+            if not is_admin:
                 async with connect() as db:
                     await _prepare(db)
                     await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
-                failure_text = status.error or "Генерация завершилась с ошибкой"
-                break
+            await status_message.edit_text(first_status.error or "Генерация завершилась с ошибкой")
+            return
 
-            if status.status == "succeeded":
-                try:
-                    await status_message.edit_text("Генерация завершена, готовлю видео…")
-                except TelegramBadRequest as exc:
-                    if not _not_modified(exc):
-                        raise
-                try:
-                    video_path = await generation_service.download_video("veo3", job_id)
-                except Exception as exc:
-                    log.exception("Veo3 download failed: %s", exc)
-                    # возврат токенов при невозможности получить результат
-                    async with connect() as db:
-                        await _prepare(db)
-                        await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
-                    failure_text = "Не удалось скачать видео"
-                    break
-                try:
-                    await message.answer_video(video=FSInputFile(video_path), caption="Готово!")
-                finally:
-                    with suppress(OSError):
-                        os.remove(video_path)
-                await status_message.edit_text("Видео отправлено")
-                return
+        try:
+            await status_message.edit_text("Генерация завершена, готовлю видео…")
+        except TelegramBadRequest as exc:
+            if not _not_modified(exc):
+                raise
 
-            progress = status.progress or 0
-            try:
-                await status_message.edit_text(f"Генерация началась\nГотовность: {progress}%")
-            except TelegramBadRequest as exc:
-                if not _not_modified(exc):
-                    raise
-            await asyncio.sleep(poll_interval)
+        try:
+            video_path_first = await generation_service.download_video("veo3", job_id_first)
+        except Exception as exc:
+            log.exception("Veo3 download (first) failed: %s", exc)
+            if not is_admin:
+                async with connect() as db:
+                    await _prepare(db)
+                    await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+            await status_message.edit_text("Не удалось скачать видео")
+            return
 
-        if failure_text:
-            await status_message.edit_text(failure_text)
+        # Постпроцесс (интро из фото) — если есть reference_url
+        to_send_first = await _stitch_if_needed(reference_url, Path(video_path_first))
+
+        # Остаток баланса для подписи
+        caption_first = "Ваше видео сгенерировано. Спасибо что пользуетесь нашим ботом"
+        if not is_admin:
+            async with connect() as db:
+                await _prepare(db)
+                left_balance = await get_user_balance(db, cb.from_user.id)
+            caption_first = f"Ваше видео сгенерировано. Остаток баланса - {left_balance} токенов. Спасибо что пользуетесь нашим ботом"
+
+        # Отправляем первое видео + клавиатуру «ещё / главное меню»
+        try:
+            await message.answer_video(
+                video=FSInputFile(to_send_first),
+                caption=caption_first,
+                reply_markup=veo_post_gen_kb(),
+            )
+        finally:
+            with suppress(OSError):
+                os.remove(video_path_first)
+            if to_send_first != Path(video_path_first):
+                with suppress(OSError):
+                    os.remove(to_send_first)
+
+        # Если референса нет — завершаем как раньше (одинарный рендер)
+        if not has_reference:
+            await status_message.edit_text("Видео отправлено")
+            return
+
+        # ---------- Второй рендер: HQ 1080п как «Оригинал (HQ)» ----------
+        try:
+            job_id_hq = await generation_service.create_video(
+                provider="veo3",
+                prompt=prompt,
+                aspect_ratio=aspect,
+                resolution=1080,
+                negative_prompt=negative_prompt,
+                fast=(mode == "fast"),
+                reference_file_id=ref_value,
+                strict_ar=strict,
+            )
+        except Exception as exc:
+            log.exception("Veo3 submit (HQ) failed: %s", exc)
+            await status_message.edit_text("Видео отправлено (HQ-версию начать не удалось)")
+            return
+
+        hq_status = await generation_service.wait_for_completion(
+            Provider.VEO3, job_id_hq, interval_sec=poll_interval, timeout_sec=max(60.0, settings.JOB_MAX_WAIT_MIN * 60)
+        )
+        if hq_status.status != "succeeded":
+            await status_message.edit_text("Видео отправлено (HQ-версию сгенерировать не удалось)")
+            return
+
+        try:
+            video_path_hq = await generation_service.download_video("veo3", job_id_hq)
+        except Exception as exc:
+            log.exception("Veo3 download (HQ) failed: %s", exc)
+            await status_message.edit_text("Видео отправлено (HQ-версию скачать не удалось)")
+            return
+
+        to_send_hq = await _stitch_if_needed(reference_url, Path(video_path_hq))
+        try:
+            await message.answer_video(video=FSInputFile(to_send_hq), caption="Оригинал (HQ)")
+        finally:
+            with suppress(OSError):
+                os.remove(video_path_hq)
+            if to_send_hq != Path(video_path_hq):
+                with suppress(OSError):
+                    os.remove(to_send_hq)
+
+        await status_message.edit_text("Видео отправлено")
         return
 
     if action == "reset":
@@ -386,7 +522,11 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer()
         await state.clear()
         try:
-            await message.edit_text(text=WELCOME, reply_markup=main_menu_kb())
+            # подставляем актуальный баланс в кнопку главного меню
+            async with connect() as db:
+                await _prepare(db)
+                bal = await get_user_balance(db, cb.from_user.id)
+            await message.edit_text(text=WELCOME, reply_markup=main_menu_kb(bal))
         except TelegramBadRequest as exc:
             if not _not_modified(exc):
                 raise
@@ -418,10 +558,24 @@ async def negative_input(msg: Message, state: FSMContext) -> None:
     await msg.answer("Negative prompt сохранён")
 
 
-@router.message(VeoWizardStates.reference_input, F.photo)
+@router.message(VeoWizardStates.reference_input, F.photo | F.document)
 async def reference_input(msg: Message, state: FSMContext) -> None:
-    file = msg.photo[-1]
-    data = await _update_data(state, reference_file_id=file.file_id)
+    """
+    Принимаем фото-референс как Photo или как документ-изображение.
+    Сразу пытаемся получить прямой URL и сохраняем его (для постпроцессинга).
+    """
+    file_id: str | None = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file_id = msg.document.file_id
+
+    if not file_id:
+        await msg.answer("Пришлите изображение (фото) в качестве референса")
+        return
+
+    url = await _file_id_to_url(msg.bot, file_id)
+    data = await _update_data(state, reference_file_id=file_id, reference_url=url)
     await state.set_state(VeoWizardStates.summary)
     await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
     await msg.answer("Референс сохранён")
@@ -431,6 +585,8 @@ async def reference_input(msg: Message, state: FSMContext) -> None:
 async def reference_input_invalid(msg: Message) -> None:
     await msg.answer("Пришлите изображение в качестве референса")
 
+
+# --------------- Luma ---------------
 
 class LumaWizardStates(StatesGroup):
     summary = State()
@@ -479,7 +635,6 @@ async def _luma_get_summary_meta(state: FSMContext) -> dict[str, Any] | None:
 
 
 def _render_luma_summary(state: dict[str, Any]) -> str:
-    # версия без строки «Режим»
     prompt = state.get("prompt") or "—"
     video = "да" if state.get("video_file_id") else "нет"
     intensity = int(state.get("intensity") or 1)
@@ -585,11 +740,11 @@ async def luma_callback(cb: CallbackQuery, state: FSMContext) -> None:
         video_file_id = data.get("video_file_id")
         if video_file_id:
             if not prompt:
-                await cb.answer("Добавьте промт (для редактирования видео)", show_alert=True)
+                await cb.answer("Добавьте промпт (для редактирования видео)", show_alert=True)
                 return
         else:
             if not prompt:
-                await cb.answer("Добавьте промт (генерация по тексту)", show_alert=True)
+                await cb.answer("Добавьте промпт (генерация по тексту)", show_alert=True)
                 return
         await cb.answer("Запуск…")
         await _run_luma_generation(message, data)
@@ -605,7 +760,11 @@ async def luma_callback(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer()
         await state.clear()
         try:
-            await message.edit_text(text=WELCOME, reply_markup=main_menu_kb())
+            # подставляем актуальный баланс в кнопку главного меню
+            async with connect() as db:
+                await _prepare(db)
+                bal = await get_user_balance(db, cb.from_user.id)
+            await message.edit_text(text=WELCOME, reply_markup=main_menu_kb(bal))
         except TelegramBadRequest as exc:
             if not _not_modified(exc):
                 raise
@@ -651,24 +810,33 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
     intensity = int(data.get("intensity") or 1)
     mode = "edit" if video_file_id else "generate"
 
-    # 1) Баланс
-    async with connect() as db:
-        await _prepare(db)
-        bal = await get_user_balance(db, message.from_user.id)
-    if bal < GENERATION_COST_TOKENS:
-        await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
-        return
+    is_admin = _is_admin(message.from_user.id)
 
-    # 2) Списываем токены (атомарно)
+    # Гарантируем наличие пользователя (для новичков)
     async with connect() as db:
         await _prepare(db)
-        charged = await charge_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
-    if not charged:
-        await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
-        return
+        await ensure_user(db, message.from_user.id, message.from_user.username, settings.FREE_TOKENS_ON_JOIN)
+
+    # 1) Баланс (для не-админов)
+    if not is_admin:
+        async with connect() as db:
+            await _prepare(db)
+            bal = await get_user_balance(db, message.from_user.id)
+        if bal < GENERATION_COST_TOKENS:
+            await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
+            return
+
+    # 2) Списываем токены (для не-админов)
+    if not is_admin:
+        async with connect() as db:
+            await _prepare(db)
+            charged = await charge_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+        if not charged:
+            await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
+            return
 
     status_message = await message.answer("Генерация началась…")
-    extras: dict[str, Any] = {"intensity": intensity}
+    extras: dict[str, Any] = {"intensity": int(max(1, min(3, intensity)))}
     if mode == "edit" and video_file_id:
         extras["video_file_id"] = video_file_id
 
@@ -699,8 +867,9 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
         async with connect() as db:
             await _prepare(db)
             await set_job_status(db, job_id, "failed")
-            # возврат токенов
-            await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+            # возврат токенов (если не админ)
+            if not is_admin:
+                await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
         return
 
     async with connect() as db:
@@ -719,9 +888,10 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
             break
 
         if status.status == "failed":
-            async with connect() as db:
-                await _prepare(db)
-                await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+            if not is_admin:
+                async with connect() as db:
+                    await _prepare(db)
+                    await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
             failure_text = status.error or "Luma не смогла завершить задачу"
             break
 
@@ -735,9 +905,10 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
                 video_path = await generation_service.download_job(Provider.LUMA, provider_job_id)
             except Exception as exc:
                 log.exception("Luma download failed: %s", exc)
-                async with connect() as db:
-                    await _prepare(db)
-                    await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+                if not is_admin:
+                    async with connect() as db:
+                        await _prepare(db)
+                        await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
                 failure_text = "Не удалось скачать видео"
                 break
             try:

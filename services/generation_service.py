@@ -78,10 +78,14 @@ async def create_video(
     negative_prompt: str | None = None,
     fast: bool = False,
     reference_file_id: str | None = None,
+    strict_ar: bool = False,   # <--- добавлено
 ) -> JobId:
     """
     Convenience helper used by the Veo3 wizard.
     Duration убрана из публичного интерфейса — используется дефолт модели (Veo3).
+
+    reference_file_id может быть как Telegram file_id, так и уже готовым HTTP URL.
+    Провайдер Veo3 сам разберётся, как это использовать.
     """
     provider_enum = _to_provider_enum(provider)
     if provider_enum is not Provider.VEO3:
@@ -91,13 +95,15 @@ async def create_video(
     if not isinstance(provider_impl, Veo3Provider):
         raise RuntimeError("Configured provider is not Veo3Provider")
 
+    # Прокидываем все параметры напрямую. Жёсткое соблюдение AR управляется strict_ar.
     return await provider_impl.create_video(
-        prompt=prompt,
+        prompt=prompt.strip(),
         aspect_ratio=aspect_ratio,
         resolution=resolution,
         negative_prompt=negative_prompt,
         fast=fast,
         reference_file_id=reference_file_id,
+        strict_ar=strict_ar,   # <--- прокинуто
     )
 
 
