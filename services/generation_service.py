@@ -69,31 +69,6 @@ def _to_provider_enum(provider: Union[str, Provider]) -> Provider:
     return Provider(provider) if not isinstance(provider, Provider) else provider
 
 
-def _aspect_hint(aspect_ratio: str, resolution: int) -> str:
-    """
-    Жёсткий хинт композиции для Veo3: позитив + явные отрицания противоположной ориентации.
-    Это нужно, пока REST Veo3 не принимает config с aspect ratio.
-    """
-    ar = (aspect_ratio or "").strip()
-    res = int(resolution or 720)
-
-    if ar == "9:16":
-        # Портретная ориентация (вертикаль)
-        w, h = (720, 1280) if res <= 720 else (1080, 1920)
-        return (
-            f" (vertical 9:16, portrait framing, {w}x{h},"
-            f" tall smartphone aspect; do not use widescreen, not landscape,"
-            f" not 16:9, not {1920 if w==1080 else 1280}x{1080 if h==720 else 720})"
-        )
-
-    # По умолчанию — 16:9 (горизонт)
-    w, h = (1280, 720) if res <= 720 else (1920, 1080)
-    return (
-        f" (widescreen 16:9, landscape framing, {w}x{h}, cinematic horizontal,"
-        f" not vertical, not portrait, not 9:16, not {1080 if w==1920 else 720}x{1920 if h==1080 else 1280})"
-    )
-
-
 async def create_video(
     *,
     provider: str,
@@ -103,10 +78,14 @@ async def create_video(
     negative_prompt: str | None = None,
     fast: bool = False,
     reference_file_id: str | None = None,
+    strict_ar: bool = False,   # <--- добавлено
 ) -> JobId:
     """
     Convenience helper used by the Veo3 wizard.
     Duration убрана из публичного интерфейса — используется дефолт модели (Veo3).
+
+    reference_file_id может быть как Telegram file_id, так и уже готовым HTTP URL.
+    Провайдер Veo3 сам разберётся, как это использовать.
     """
     provider_enum = _to_provider_enum(provider)
     if provider_enum is not Provider.VEO3:
@@ -116,17 +95,15 @@ async def create_video(
     if not isinstance(provider_impl, Veo3Provider):
         raise RuntimeError("Configured provider is not Veo3Provider")
 
-    # Временный хак: добавляем сильный AR-хинт в промпт,
-    # чтобы модель соблюдала выбранную ориентацию.
-    prompt_with_hint = f"{prompt}{_aspect_hint(aspect_ratio, resolution)}".strip()
-
+    # Прокидываем все параметры напрямую. Жёсткое соблюдение AR управляется strict_ar.
     return await provider_impl.create_video(
-        prompt=prompt_with_hint,
-        aspect_ratio=aspect_ratio,   # оставляем для совместимости на будущее
+        prompt=prompt.strip(),
+        aspect_ratio=aspect_ratio,
         resolution=resolution,
         negative_prompt=negative_prompt,
         fast=fast,
         reference_file_id=reference_file_id,
+        strict_ar=strict_ar,   # <--- прокинуто
     )
 
 

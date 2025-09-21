@@ -5,14 +5,13 @@ import re
 import secrets
 import string
 from typing import Iterable
-
 from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, Message, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import settings
@@ -202,10 +201,12 @@ async def admin_panel(msg: Message) -> None:
         InlineKeyboardButton(text="📦 Пачка кодов", callback_data="admin:promo_gen_help"),
     )
     kb.row(InlineKeyboardButton(text="📋 Список кампаний", callback_data="admin:promo_list"))
+    # Кнопка для рассылки (ведёт в handlers/broadcast.py)
+    kb.row(InlineKeyboardButton(text="📣 Сделать рассылку", callback_data="admin:broadcast"))
     await msg.answer(
-        "Админ-панель промокодов:\n"
-        "• Создавай TTL-коды, действующие ограниченное время и доступные многим пользователям.\n"
-        "• Каждый пользователь может активировать конкретный код только один раз.",
+        "Админ-панель:\n"
+        "• Промокоды (TTL, многоразовые) — управление ниже.\n"
+        "• «📣 Сделать рассылку» — отправка текста/фото всем пользователям.\n",
         reply_markup=kb.as_markup()
     )
 

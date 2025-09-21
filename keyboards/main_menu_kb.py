@@ -3,7 +3,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb(balance: float | None = None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     # Блок работы с видео
@@ -11,9 +11,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🧩 Работа с видео", callback_data="menu:video"),
     )
 
-    # Баланс
+    # Баланс (с отображением числа токенов, если передан balance)
+    balance_label = f"💳 Баланс: {balance:.1f}" if balance is not None else "💳 Баланс"
     builder.row(
-        InlineKeyboardButton(text="💳 Баланс", callback_data="menu:balance"),
+        InlineKeyboardButton(text=balance_label, callback_data="menu:balance"),
     )
 
     # Промо и подарки
@@ -37,10 +38,11 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def back_to_main_menu_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back"))
-    return builder.as_markup()
+def back_to_main_menu_kb(balance: float | None = None) -> InlineKeyboardMarkup:
+    """
+    Кнопка возврата в главное меню. Можно сразу отрисовать главное меню с балансом.
+    """
+    return main_menu_kb(balance)
 
 
 def video_menu_kb() -> InlineKeyboardMarkup:

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+
 def balance_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🧪 Пробный: 2 токена — 60 ₽", callback_data="buy:trial")],

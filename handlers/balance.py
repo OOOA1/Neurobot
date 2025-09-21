@@ -10,7 +10,7 @@ from config import settings
 from db import connect, _prepare, ensure_user, get_user_balance, add_user_tokens
 from keyboards.balance_kb import balance_kb
 from keyboards.main_menu_kb import main_menu_kb
-from texts import BALANCE_VIEW
+from texts import BALANCE_VIEW, WELCOME
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -29,7 +29,6 @@ def _is_admin(user_id: int) -> bool:
     try:
         return user_id in settings.admin_ids()
     except Exception:
-        # На случай, если метод не определён в Settings — читаем из строки env
         raw = (getattr(settings, "ADMIN_USER_IDS", "") or "").replace(" ", "")
         return str(user_id) in {x for x in raw.split(",") if x}
 
@@ -65,29 +64,37 @@ async def balance_from_menu(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "balance:back")
 async def balance_back(cb: CallbackQuery, state: FSMContext):
-    # Возврат в главное меню
-    await cb.message.edit_text("Выбери раздел в меню:", reply_markup=main_menu_kb())
+    # Возврат в главное меню с актуальным балансом в кнопке
+    async with connect() as db:
+        await _prepare(db)
+        balance = await get_user_balance(db, cb.from_user.id)
+    await cb.message.edit_text(WELCOME, reply_markup=main_menu_kb(balance))
     await cb.answer()
 
 
 @router.callback_query(F.data.startswith("buy:"))
 async def balance_buy(cb: CallbackQuery):
     plan = cb.data.split(":", 1)[1]
+    await cb.answer()  # закрываем «часики» без алёртов
+
+    if not cb.message:
+        return
 
     # Админу токены не нужны — у него безлимит
     if _is_admin(cb.from_user.id):
-        await cb.answer("У вас безлимитные токены (администратор). Покупка не требуется.", show_alert=True)
+        await cb.message.answer("У вас безлимитные токены (администратор). Покупка не требуется.")
         return
 
-    # В бою тут должен быть платёж (Invoice/PayAPI). Для DEV — начислим сразу.
+    # DEV-режим: начисляем сразу, без всплывающих алёртов
     if settings.APP_ENV.lower() == "dev" and plan in PLAN_TOKENS:
         async with connect() as db:
             await _prepare(db)
             await ensure_user(db, cb.from_user.id, cb.from_user.username, settings.FREE_TOKENS_ON_JOIN)
             await add_user_tokens(db, cb.from_user.id, PLAN_TOKENS[plan])
-        await cb.answer("Тестовый режим: токены начислены ✅", show_alert=True)
-        # Обновим экран
+
+        await cb.message.answer("Тестовый режим: токены начислены ✅")
         await _send_balance_view(cb, cb.from_user.id, cb.from_user.username)
         return
 
-    await cb.answer("Оплата этого тарифа скоро будет доступна 💳", show_alert=True)
+    # Прод: пока заглушка без алёртов
+    await cb.message.answer("Оплата этого тарифа скоро будет доступна 💳")

@@ -5,7 +5,8 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from keyboards.main_menu_kb import back_to_main_menu_kb
+from db import connect, _prepare, ensure_user, get_user_balance
+from keyboards.main_menu_kb import main_menu_kb
 
 router = Router()
 
@@ -36,6 +37,14 @@ def _ref_text(link: str) -> str:
     )
 
 
+async def _main_menu_markup_with_balance(tg_user_id: int, username: str | None):
+    async with connect() as db:
+        await _prepare(db)
+        await ensure_user(db, tg_user_id, username, 0)
+        balance = await get_user_balance(db, tg_user_id)
+    return main_menu_kb(balance)
+
+
 @router.callback_query(F.data == "menu:ref")
 async def on_referral(cb: CallbackQuery) -> None:
     await cb.answer()
@@ -43,27 +52,31 @@ async def on_referral(cb: CallbackQuery) -> None:
         return
 
     username = await _get_bot_username(cb)
+    markup = await _main_menu_markup_with_balance(cb.from_user.id, cb.from_user.username)
+
     if not username:
         await cb.message.edit_text(
             "Не удалось получить username бота. Попробуйте позже.",
-            reply_markup=back_to_main_menu_kb(),
+            reply_markup=markup,
         )
         return
 
     # персональная ссылка с параметром start=<tg_user_id>
     link = f"https://t.me/{username}?start={cb.from_user.id}"
-    await cb.message.edit_text(_ref_text(link), reply_markup=back_to_main_menu_kb())
+    await cb.message.edit_text(_ref_text(link), reply_markup=markup)
 
 
 @router.message(Command("ref"))
 @router.message(Command("referral"))
 async def cmd_referral(msg: Message) -> None:
     username = await _get_bot_username(msg)
+    markup = await _main_menu_markup_with_balance(msg.from_user.id, msg.from_user.username)
+
     if not username:
-        await msg.reply("Не удалось получить username бота. Попробуйте позже.")
+        await msg.reply("Не удалось получить username бота. Попробуйте позже.", reply_markup=markup)
         return
     link = f"https://t.me/{username}?start={msg.from_user.id}"
-    await msg.reply(_ref_text(link), reply_markup=back_to_main_menu_kb())
+    await msg.reply(_ref_text(link), reply_markup=markup)
 
 
 @router.callback_query(F.data == "menu:examples")
@@ -71,7 +84,8 @@ async def on_examples(cb: CallbackQuery) -> None:
     await cb.answer()
     if not cb.message:
         return
+    markup = await _main_menu_markup_with_balance(cb.from_user.id, cb.from_user.username)
     await cb.message.edit_text(
         "В будущем будет переход на тг канал с примерами генераций.",
-        reply_markup=back_to_main_menu_kb(),
+        reply_markup=markup,
     )

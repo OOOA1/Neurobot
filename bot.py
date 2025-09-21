@@ -12,6 +12,7 @@ from handlers import balance as balance_handlers
 from handlers import promo as promo_handlers
 from handlers import gift as gift_handlers
 from handlers import referral as referral_handlers
+from handlers import broadcast as broadcast_handlers  # <-- добавили рассылку
 
 
 async def main() -> None:
@@ -50,6 +51,7 @@ async def main() -> None:
     dp.include_router(promo_handlers.router)
     dp.include_router(gift_handlers.router)
     dp.include_router(referral_handlers.router)
+    dp.include_router(broadcast_handlers.router)  # <-- подключили роутер рассылки
 
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 

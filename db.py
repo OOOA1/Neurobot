@@ -8,6 +8,7 @@ from typing import Any, List, Tuple
 import aiosqlite
 
 from providers.base import Provider
+from config import settings  # <-- добавлено
 
 _DB_PATH = os.path.join(os.getcwd(), "mvp.sqlite3")
 
@@ -30,6 +31,9 @@ async def _prepare(db: aiosqlite.Connection) -> aiosqlite.Connection:
 # -------------------------
 
 async def get_user_balance(db: aiosqlite.Connection, tg_user_id: int) -> int:
+    # Админов считаем «бесконечными»
+    if settings.is_admin(tg_user_id):
+        return 10**9
     cur = await db.execute(
         "SELECT balance_tokens FROM users WHERE tg_user_id = ?",
         (tg_user_id,),
@@ -49,7 +53,7 @@ async def set_user_balance(db: aiosqlite.Connection, tg_user_id: int, new_balanc
 
 async def add_user_tokens(db: aiosqlite.Connection, tg_user_id: int, amount: int) -> None:
     await db.execute(
-        "UPDATE users SET balance_tokens = balance_tokens + ? WHERE tg_user_id = ?",
+        "UPDATE users SET balance_tokens = COALESCE(balance_tokens,0) + ? WHERE tg_user_id = ?",
         (amount, tg_user_id),
     )
     await db.commit()
@@ -59,7 +63,10 @@ async def charge_user_tokens(db: aiosqlite.Connection, tg_user_id: int, amount: 
     """
     Атомарно списывает amount токенов.
     Возвращает True, если списание успешно, иначе False (недостаточно токенов).
+    Для админов — всегда True и без списаний.
     """
+    if settings.is_admin(tg_user_id):
+        return True
     cur = await db.execute(
         """
         UPDATE users
@@ -75,6 +82,8 @@ async def charge_user_tokens(db: aiosqlite.Connection, tg_user_id: int, amount: 
 
 async def refund_user_tokens(db: aiosqlite.Connection, tg_user_id: int, amount: int) -> None:
     """Возврат токенов пользователю (на случай неудачной генерации)."""
+    if settings.is_admin(tg_user_id):
+        return
     await add_user_tokens(db, tg_user_id, amount)
 
 
@@ -102,9 +111,91 @@ async def transfer_tokens(db: aiosqlite.Connection, from_tg: int, to_tg: int, am
             await db.execute("ROLLBACK")
             return False
         await db.execute(
-            "UPDATE users SET balance_tokens = balance_tokens + ? WHERE tg_user_id = ?",
+            "UPDATE users SET balance_tokens = COALESCE(balance_tokens,0) + ? WHERE tg_user_id = ?",
             (amount, to_tg),
         )
+        await db.execute("COMMIT")
+        return True
+    except Exception:
+        await db.execute("ROLLBACK")
+        raise
+
+
+# -------------------------
+# Рефералка
+# -------------------------
+
+async def _ensure_referrals_schema(db: aiosqlite.Connection) -> None:
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_user_id INTEGER NOT NULL,         -- кого привели
+            referrer_tg_id INTEGER NOT NULL,     -- кто привёл
+            awarded_tokens INTEGER NOT NULL,
+            created_at INTEGER DEFAULT (strftime('%s','now')),
+            UNIQUE(tg_user_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_tg_id);
+        """
+    )
+    await db.commit()
+
+
+async def award_referral_if_eligible(
+    db: aiosqlite.Connection,
+    invited_tg: int,
+    referrer_tg: int,
+    tokens: int = 2,
+) -> bool:
+    """
+    Начисляет referrer'у токены за приглашение invited_tg ровно один раз.
+    Возвращает True, если награда выдана сейчас; False — если не положена/уже была.
+    Правила:
+      - self-ref запрещён
+      - по одному вознаграждению на каждого приглашённого
+      - обе стороны должны существовать в users (создадим при необходимости)
+    """
+    if invited_tg == referrer_tg:
+        return False
+
+    safe_tokens = max(1, int(tokens))
+
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        # уже награждали за этого пользователя?
+        cur = await db.execute(
+            "SELECT 1 FROM referrals WHERE tg_user_id = ?",
+            (invited_tg,),
+        )
+        if await cur.fetchone():
+            await db.execute("ROLLBACK")
+            return False
+
+        # гарантируем наличие приглашённого
+        await db.execute(
+            "INSERT OR IGNORE INTO users (tg_user_id, username, balance_tokens) VALUES (?, NULL, 0)",
+            (invited_tg,),
+        )
+
+        # UPSERT для реферера
+        await db.execute(
+            """
+            INSERT INTO users (tg_user_id, username, balance_tokens)
+            VALUES (?, NULL, ?)
+            ON CONFLICT(tg_user_id) DO UPDATE SET
+                balance_tokens = COALESCE(users.balance_tokens, 0) + excluded.balance_tokens
+            """,
+            (referrer_tg, safe_tokens),
+        )
+
+        # фиксируем факт реферала
+        await db.execute(
+            "INSERT INTO referrals (tg_user_id, referrer_tg_id, awarded_tokens) VALUES (?,?,?)",
+            (invited_tg, referrer_tg, safe_tokens),
+        )
+
         await db.execute("COMMIT")
         return True
     except Exception:
@@ -125,9 +216,10 @@ async def migrate() -> None:
             await db.commit()
         await _ensure_job_schema(db)
         await _ensure_user_columns(db)
-        await _ensure_promocodes_schema(db)          # скидочные промокоды (если используешь)
-        await _ensure_token_promocodes_schema(db)    # одноразовые промокоды на токены
-        await _ensure_token_promo_campaigns_schema(db)  # многоразовые промокоды с TTL
+        await _ensure_promocodes_schema(db)            # скидочные промокоды (если используешь)
+        await _ensure_token_promocodes_schema(db)      # одноразовые промокоды на токены
+        await _ensure_token_promo_campaigns_schema(db) # многоразовые промокоды с TTL
+        await _ensure_referrals_schema(db)             # рефералка
 
 
 async def _ensure_user_columns(db: aiosqlite.Connection) -> None:
@@ -258,6 +350,33 @@ async def ensure_user(
     return await get_user_by_tg(db, tg_user_id)
 
 
+# 👇 Новая утилита для рассылок / статистики
+async def list_active_user_ids(
+    db: aiosqlite.Connection,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[int]:
+    """
+    Возвращает список Telegram ID активных пользователей для рассылки.
+    Исключаются забаненные (is_banned=1) и записи без tg_user_id.
+    Можно постранично запрашивать через limit/offset.
+    """
+    sql = (
+        "SELECT tg_user_id FROM users "
+        "WHERE tg_user_id IS NOT NULL AND COALESCE(is_banned,0)=0 "
+        "ORDER BY id ASC"
+    )
+    params: tuple[Any, ...] = ()
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params = (int(limit), int(offset))
+    cur = await db.execute(sql, params)
+    rows = await cur.fetchall()
+    await cur.close()
+    return [int(r["tg_user_id"]) for r in rows]
+
+
 # -------------------------
 # Джобы (генерации)
 # -------------------------
@@ -376,7 +495,7 @@ async def create_promocode(
     await db.commit()
 
 
-async def list_promocodes(db: aiosqlite.Connection, limit: int = 20) -> list[dict[str, Any]]:
+async def list_promocodes(db: aiosqlite.Connection, limit: int) -> list[dict[str, Any]]:
     cur = await db.execute(
         """
         SELECT code, discount_percent, is_used, used_by, created_by, created_at
@@ -494,7 +613,6 @@ async def redeem_token_promocode(
 
         tokens = int(row["tokens"])
 
-        # помечаем использованным
         cur2 = await db.execute(
             "UPDATE token_promocodes SET is_used = 1, used_by = ? WHERE code = ? AND is_used = 0",
             (tg_user_id, code),
@@ -503,7 +621,6 @@ async def redeem_token_promocode(
             await db.execute("ROLLBACK")
             return 0
 
-        # начисляем токены пользователю
         await db.execute(
             "UPDATE users SET balance_tokens = COALESCE(balance_tokens,0) + ? WHERE tg_user_id = ?",
             (tokens, tg_user_id),
@@ -612,7 +729,6 @@ async def redeem_token_promo_code_ttl(
         campaign_id = int(camp["id"])
         tokens = int(camp["tokens"])
 
-        # проверяем, активировал ли уже этот пользователь
         cur2 = await db.execute(
             "SELECT 1 FROM token_promo_redemptions WHERE campaign_id = ? AND tg_user_id = ?",
             (campaign_id, tg_user_id),
@@ -623,13 +739,11 @@ async def redeem_token_promo_code_ttl(
             await db.execute("ROLLBACK")
             return 0, "already_used"
 
-        # записываем активацию
         await db.execute(
             "INSERT INTO token_promo_redemptions (campaign_id, tg_user_id) VALUES (?, ?)",
             (campaign_id, tg_user_id),
         )
 
-        # начисляем токены
         await db.execute(
             "UPDATE users SET balance_tokens = COALESCE(balance_tokens,0) + ? WHERE tg_user_id = ?",
             (tokens, tg_user_id),
