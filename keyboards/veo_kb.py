@@ -50,10 +50,7 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
         )
     )
 
-    if reference_present:
-        builder.row(
-            InlineKeyboardButton(text="❌ Убрать референс", callback_data="veo:ref:clear")
-        )
+    # Никакого «Убрать референс» — по требованию дизайна
 
     # Соотношение сторон
     builder.row(

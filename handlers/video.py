@@ -58,8 +58,8 @@ class VeoWizardStates(StatesGroup):
 
 VEO_DEFAULT_STATE: dict[str, Any] = {
     "prompt": None,
-    "negative_enabled": False,   # не показывается в UI
-    "negative_text": None,       # не показывается в UI
+    "negative_enabled": False,
+    "negative_text": None,
     "ar": "16:9",
     "mode": "quality",
     "reference_file_id": None,
@@ -121,7 +121,7 @@ async def _get_summary_meta(state: FSMContext) -> dict[str, Any] | None:
         return meta
     return None
 
-# -------- summary text (человечный, с эмодзи и стоимостью) --------
+# -------- summary text --------
 def _render_summary(state: dict[str, Any]) -> str:
     prompt = (state.get("prompt") or "").strip()
     has_ref = bool(state.get("reference_file_id") or state.get("reference_url") or state.get("image_bytes"))
@@ -130,13 +130,9 @@ def _render_summary(state: dict[str, Any]) -> str:
     mode_label = "Fast ⚡" if mode == "fast" else "Quality 🎬"
     cost = _current_cost(state)
 
-    # стартовый экран — когда ничего ещё не задано
     if not prompt and not has_ref:
-        return (
-            "🚀 Режим генерации активирован. Пришлите промпт или фото, затем нажмите «Сгенерировать»."
-        )
+        return "🚀 Режим генерации активирован. Пришлите промпт или фото, затем нажмите «Сгенерировать»."
 
-    # «полная» сводка
     lines: list[str] = []
     if prompt:
         lines.append("✍️ Промпт:")
@@ -146,7 +142,6 @@ def _render_summary(state: dict[str, Any]) -> str:
 
     lines.append(f"\n🖼 Референс: {'добавлен' if has_ref else '—'}")
 
-    # параметры
     ar_icon = "📱" if ar == "9:16" else "🖥️"
     lines.append("\n🧩 Параметры генерации:")
     lines.append(f"• Формат: {ar} {ar_icon}")
@@ -154,45 +149,61 @@ def _render_summary(state: dict[str, Any]) -> str:
     lines.append(f"• Промпт: {'есть 💪' if prompt else 'нет —'}")
     lines.append(f"• Референс: {'есть 🖼' if has_ref else 'нет —'}")
     lines.append(f"• Стоимость: {cost:.1f} токена(ов) 💰")
-
     return "\n".join(lines)
 
-async def _edit_summary(*, message: Message | None, bot, state: FSMContext, data: dict[str, Any]) -> None:
+# ---- Рендер/обновление сводки с надёжным фоллбэком ----
+async def _edit_summary(
+    *,
+    message: Message | None,
+    bot,
+    state: FSMContext,
+    data: dict[str, Any],
+    fallback: Message | None = None,  # сюда передаём msg, если редактируем по meta
+) -> None:
     text = _render_summary(data)
     markup = veo_options_kb(data)
+
+    # 1) Если передан сам message (обычно это и есть сводка) — пробуем редактировать его.
     if message is not None:
         try:
             await message.edit_text(text, reply_markup=markup)
+            return
         except TelegramBadRequest as exc:
             if _not_modified(exc):
-                try:
+                with suppress(TelegramBadRequest):
                     await message.edit_reply_markup(reply_markup=markup)
-                except TelegramBadRequest as inner_exc:
-                    if not _not_modified(inner_exc):
-                        raise
-            else:
-                raise
-        return
-    if bot is None:
-        return
+                return
+            # Падает редактирование? Отправляем новое.
+            if fallback is None:
+                fallback = message
+        except Exception:
+            if fallback is None:
+                fallback = message
+
+    # 2) Путь через сохранённую meta (обычно для обновления «издалека»).
     meta = await _get_summary_meta(state)
-    if not meta:
-        return
-    try:
-        await bot.edit_message_text(
-            chat_id=meta["chat_id"], message_id=meta["message_id"], text=text, reply_markup=markup
-        )
-    except TelegramBadRequest as exc:
-        if _not_modified(exc):
-            try:
-                await bot.edit_message_reply_markup(
-                    chat_id=meta["chat_id"], message_id=meta["message_id"], reply_markup=markup
-                )
-            except TelegramBadRequest as inner_exc:
-                if not _not_modified(inner_exc):
-                    raise
-        else:
-            raise
+    if meta:
+        try:
+            await bot.edit_message_text(
+                chat_id=meta["chat_id"], message_id=meta["message_id"], text=text, reply_markup=markup
+            )
+            return
+        except TelegramBadRequest as exc:
+            if _not_modified(exc):
+                with suppress(TelegramBadRequest):
+                    await bot.edit_message_reply_markup(
+                        chat_id=meta["chat_id"], message_id=meta["message_id"], reply_markup=markup
+                    )
+                return
+            # если редактирование не удалось — попробуем отправить новое сообщение ниже
+        except Exception:
+            pass
+
+    # 3) Надёжный фоллбэк — присылаем новую сводку в чат пользователя.
+    if fallback is not None:
+        with suppress(Exception):
+            new_msg = await fallback.answer(text, reply_markup=markup)
+            await _store_summary(new_msg, state)
 
 async def _ensure_summary_message(msg: Message, state: FSMContext) -> Message:
     data = await _get_data(state)
@@ -263,16 +274,10 @@ async def _fetch_image_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]:
         return None, None
 
 async def _stitch_if_needed(reference_url: str | None, video_path: Path) -> Path:
-    # Больше не делаем интро из фото — Veo генерирует нативно по image_bytes.
     return video_path
 
 # --- фикс чёрных полос: асинхронная обёртка ---
 async def _normalize_result(src: Path, aspect: str) -> Path:
-    """
-    Нормализуем выдачу:
-    - для 16:9 — принудительный cover+crop до 1920x1080 (без внутренних рамок);
-    - для 9:16 — вертикальный 1080x1920 канвас с блюр-подложкой.
-    """
     try:
         if aspect == "9:16":
             dst = src.with_name(src.stem + "_blurpad.mp4")
@@ -285,10 +290,9 @@ async def _normalize_result(src: Path, aspect: str) -> Path:
         log.exception("output normalization failed: %s", exc)
         return src
 
-# ---------- НОВОЕ: прямой ввод в summary ----------
+# ---------- прямой ввод в summary ----------
 @router.message(VeoWizardStates.summary, F.text)
 async def veo_summary_text_input(msg: Message, state: FSMContext) -> None:
-    # игнорируем команды
     if (msg.text or "").strip().startswith("/"):
         return
     text = (msg.text or "").strip()
@@ -299,7 +303,7 @@ async def veo_summary_text_input(msg: Message, state: FSMContext) -> None:
         await msg.answer(f"Промт отклонён модерацией: {moderation.reason}")
         return
     data = await _update_data(state, prompt=text)
-    await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
+    await _edit_summary(message=None, bot=msg.bot, state=state, data=data, fallback=msg)
 
 @router.message(VeoWizardStates.summary, F.photo | (F.document & (F.document.mime_type.startswith("image/"))))
 async def veo_summary_image_input(msg: Message, state: FSMContext) -> None:
@@ -324,7 +328,7 @@ async def veo_summary_image_input(msg: Message, state: FSMContext) -> None:
         image_bytes=img_bytes,
         image_mime=img_mime,
     )
-    await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
+    await _edit_summary(message=None, bot=msg.bot, state=state, data=data, fallback=msg)
 
 # ---------- Клавиатурные колбэки ----------
 @router.callback_query(F.data.startswith("veo:"))
@@ -348,7 +352,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "res":
-        await cb.answer(); return  # игнор
+        await cb.answer(); return
 
     if action == "mode":
         if value in {"fast", "quality"}:
@@ -373,17 +377,43 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "prompt" and value == "input":
-        await cb.answer("Введите промпт")
-        await message.answer("Отправьте текст промпта")
+        had_prompt = bool((data.get("prompt") or "").strip())
+        if had_prompt:
+            data = await _update_data(state, prompt=None)
+            await message.answer("Текущий промпт очищен. Пришлите новый текст-промпт.")
+            await _edit_summary(message=message, bot=message.bot, state=state, data=data)
+        else:
+            await message.answer("Отправьте текст промпта")
+
         await state.set_state(VeoWizardStates.prompt_input)
+        await cb.answer()
         return
 
     if action == "ref" and value == "attach":
-        await cb.answer("Пришлите изображение-референс")
+        ref_exists = bool(
+            data.get("reference_file_id") or
+            data.get("reference_url") or
+            data.get("image_bytes")
+        )
+        if ref_exists:
+            data = await _update_data(
+                state,
+                reference_file_id=None,
+                reference_url=None,
+                image_bytes=None,
+                image_mime=None,
+            )
+            await message.answer("Референс очищен. Пришлите новое фото (jpg/png).")
+            await _edit_summary(message=message, bot=message.bot, state=state, data=data)
+        else:
+            await message.answer("Пришлите изображение-референс (jpg/png).")
+
         await state.set_state(VeoWizardStates.reference_input)
+        await cb.answer()
         return
 
     if action == "ref" and value == "clear":
+        # Кнопки очистки сейчас нет в UI, но обработчик оставим на всякий случай.
         data = await _update_data(
             state, reference_file_id=None, reference_url=None, image_bytes=None, image_mime=None
         )
@@ -402,19 +432,17 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             await cb.answer("Выберите соотношение сторон (16:9 / 9:16)", show_alert=True)
             return
 
-        resolution_first = 1080  # провайдер сам понизит до 720p для 9:16
+        resolution_first = 1080
         reference_file_id = data.get("reference_file_id")
         reference_url = data.get("reference_url")
         mode = (data.get("mode") or "quality").lower()
         negative_prompt = (data.get("negative_text") or None) if data.get("negative_enabled") else None
         is_admin = _is_admin(cb.from_user.id)
 
-        # ensure user
         async with connect() as db:
             await _prepare(db)
             await ensure_user(db, cb.from_user.id, cb.from_user.username, settings.FREE_TOKENS_ON_JOIN)
 
-        # динамическая стоимость
         expected_cost = _current_cost(data)
 
         if not is_admin:
@@ -476,7 +504,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             return
 
         poll_interval = max(3.0, settings.JOB_POLL_INTERVAL_SEC)
-        interval_plan = [6.0, 10.0, 15.0]  # реже опрашиваем Veo, меньше запросов
+        interval_plan = [6.0, 10.0, 15.0]
         first_status = await generation_service.wait_for_completion(
             Provider.VEO3, job_id_first, interval_sec=poll_interval,
             timeout_sec=max(60.0, settings.JOB_MAX_WAIT_MIN * 60), interval_schedule=interval_plan
@@ -506,7 +534,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             await status_message.edit_text("Не удалось скачать видео")
             return
 
-        to_send_first = video_path_first  # без интро
+        to_send_first = video_path_first
         to_send_first_fixed = await _normalize_result(Path(to_send_first), aspect)
 
         caption_first = "Ваше видео сгенерировано. Спасибо что пользуетесь нашим ботом"
@@ -536,7 +564,6 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 with suppress(OSError):
                     os.remove(to_send_first_fixed)
 
-        # HQ делаем только в режиме 'quality'
         if mode != "quality":
             await status_message.edit_text("Видео отправлено")
             return
@@ -615,7 +642,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
 
     await cb.answer()
 
-# ----- старые ручки (по кнопкам) оставил как есть -----
+# ----- старые ручки -----
 @router.message(VeoWizardStates.prompt_input)
 async def prompt_input(msg: Message, state: FSMContext) -> None:
     text = (msg.text or "").strip()
@@ -624,7 +651,7 @@ async def prompt_input(msg: Message, state: FSMContext) -> None:
         return
     data = await _update_data(state, prompt=text)
     await state.set_state(VeoWizardStates.summary)
-    await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
+    await _edit_summary(message=None, bot=msg.bot, state=state, data=data, fallback=msg)
     await msg.answer("Промт обновлён")
 
 @router.message(VeoWizardStates.negative_input)
@@ -635,7 +662,7 @@ async def negative_input(msg: Message, state: FSMContext) -> None:
         return
     data = await _update_data(state, negative_text=text)
     await state.set_state(VeoWizardStates.summary)
-    await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
+    await _edit_summary(message=None, bot=msg.bot, state=state, data=data, fallback=msg)
     await msg.answer("Negative prompt сохранён")
 
 @router.message(VeoWizardStates.reference_input, F.photo | F.document)
@@ -665,14 +692,14 @@ async def reference_input(msg: Message, state: FSMContext) -> None:
         image_mime=img_mime,
     )
     await state.set_state(VeoWizardStates.summary)
-    await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
+    await _edit_summary(message=None, bot=msg.bot, state=state, data=data, fallback=msg)
     await msg.answer("Референс сохранён")
 
 @router.message(VeoWizardStates.reference_input)
 async def reference_input_invalid(msg: Message) -> None:
     await msg.answer("Пришлите изображение в качестве референса")
 
-# --------------- Luma (без изменений значимой логики) ---------------
+# --------------- Luma ---------------
 class LumaWizardStates(StatesGroup):
     summary = State()
     prompt_input = State()

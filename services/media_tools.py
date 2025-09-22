@@ -479,3 +479,41 @@ def build_vertical_blurpad(src_path: str | Path, dst_path: str | Path) -> None:
         cmd += ["-an"]
     cmd += [dst]
     _run_sync(cmd)
+
+# --- mini tmp cleanup (startup + on-exit) ---
+import atexit, time, tempfile
+
+# Папка для временных медиа: можно переопределить через .env -> MEDIA_TMP_DIR=/var/tmp/neurobot
+MEDIA_TMP_DIR = Path(os.getenv("MEDIA_TMP_DIR") or tempfile.gettempdir())
+MEDIA_TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Какие файлы чистим (наши типовые артефакты)
+_TMP_PATTERNS = tuple(
+    (os.getenv("TMP_PATTERNS") or "veo3_*.mp4,*_normalized.mp4,*_blurpad.mp4")
+    .split(",")
+)
+
+def _sweep(dirpath: Path, max_age_h: int | float = float(os.getenv("TMP_MAX_AGE_H", "24"))) -> None:
+    """Удаляем временные видео-артефакты старше max_age_h часов."""
+    now = time.time()
+    for pat in _TMP_PATTERNS:
+        pat = pat.strip()
+        if not pat:
+            continue
+        for p in dirpath.glob(pat):
+            try:
+                if p.stat().st_mtime < (now - float(max_age_h) * 3600.0):
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+# 1) Оппортунистическая уборка при импорте
+try:
+    _sweep(MEDIA_TMP_DIR)
+    _sweep(Path.cwd())  # на случай, если что-то складывается в рабочую директорию
+except Exception:
+    pass
+
+# 2) Уборка при штатном завершении процесса
+atexit.register(_sweep, MEDIA_TMP_DIR)
+atexit.register(_sweep, Path.cwd())
