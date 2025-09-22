@@ -7,10 +7,12 @@ services/media_tools.py
 Набор утилит для постпроцессинга видео:
 - probe_video: получить (width, height, fps) видео через ffprobe
 - probe_duration: получить длительность файла в секундах через ffprobe
-- build_intro_from_image: сделать короткий mp4 из картинки нужного размера
+- build_intro_from_image: сделать короткий mp4 из картинки нужного размера (cover: без паддингов)
 - concat_two: склеить интро и основное видео без перехода (только видео)
 - concat_with_crossfade: склеить с плавным переходом (кроссфейд), сохранить аудио из второго клипа (если есть)
-- enforce_ar_no_bars: убрать чёрные поля (letterbox) кропом под заданное соотношение сторон и привести к точному размеру
+- enforce_ar_no_bars: убрать чёрные поля (letterbox) кропом под заданное соотношение сторон,
+  привести к точному размеру и зафиксировать SAR/DAR (исключает полосы в плеерах)
+- build_vertical_blurpad: сформировать вертикальный 1080x1920 канвас с размытым фоном (как Reels/TikTok)
 """
 
 import asyncio
@@ -18,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+import math
 from pathlib import Path
 from typing import Tuple
 
@@ -25,6 +28,12 @@ from typing import Tuple
 DEFAULT_CRF = int(os.getenv("VIDEO_CRF", "18"))
 DEFAULT_PRESET = os.getenv("FFMPEG_PRESET", "slow").strip() or "slow"
 LOG_CMD = os.getenv("FFMPEG_LOG_CMD", "0") in ("1", "true", "True", "YES", "yes")
+
+# -------- утилиты --------
+def _ratio_str(w: int, h: int) -> str:
+    """Вернёт сокращённую строку вида '16/9' для setdar."""
+    g = math.gcd(max(1, int(w)), max(1, int(h)))
+    return f"{int(w)//g}/{int(h)//g}"
 
 # -------- поиск бинарников --------
 def _ensure_path(p: str | Path) -> str:
@@ -244,19 +253,21 @@ async def build_intro_from_image(
 ) -> None:
     """
     Делает короткий mp4 из картинки под нужный размер:
-    - масштабирование с сохранением пропорций
-    - паддинг до точного размера
+    - масштабирование с «избытком» и кроп под точные размеры (cover: БЕЗ паддингов → без чёрных полос)
+    - фиксирует SAR=1 и DAR (например 16/9 или 9/16)
     - yuv420p для совместимости
     - качество: -crf 18, -preset slow (переопределяется переменными)
     """
     image_path = _ensure_path(image_path)
     out_path = _ensure_path(out_path)
     fps_i = max(1, int(round(fps)))
+    dar = _ratio_str(width, height)
 
     vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-        f"format=yuv420p,fps={fps_i}"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},"
+        f"setsar=1,setdar={dar},"
+        f"fps={fps_i},format=yuv420p"
     )
 
     cmd = [
@@ -377,43 +388,57 @@ async def concat_with_crossfade(
 
 
 # -------- анти-рамки (удаление чёрных полос) --------
+
+def _parse_crop_from_stderr(stderr: str) -> Tuple[int, int, int, int] | None:
+    """
+    Парсит последнюю подсказку вида 'crop=w:h:x:y' из stderr ffmpeg (cropdetect).
+    Возвращает (w, h, x, y) или None.
+    """
+    last = None
+    for line in (stderr or '').splitlines():
+        line = line.strip()
+        if 'crop=' in line:
+            idx = line.rfind('crop=')
+            seg = line[idx + 5 :].strip()
+            parts = seg.split(':')
+            if len(parts) >= 4:
+                try:
+                    cw = int(parts[0]); ch = int(parts[1]); cx = int(parts[2]); cy = int(parts[3])
+                    last = (cw, ch, cx, cy)
+                except Exception:
+                    pass
+    return last
+
+
+def _even(val: int) -> int:
+    return val if val % 2 == 0 else val - 1
+
+
 def enforce_ar_no_bars(src_path: str | Path, dst_path: str | Path, aspect: str) -> None:
     """
-    Удаляет letterbox кропом под заданное соотношение сторон и
-    ДОВОДИТ размер до точного целевого разрешения:
-      - 16:9 → 1920x1080
-      - 9:16 → 1080x1920
-
-    Это гарантирует отсутствие чёрных полей в Telegram/мобильных плеерах,
-    даже если исходник имеет нетипичную высоту (например, 1920x1088).
-
-    Аудио (если есть) копируется без перекодирования.
+    Нормализация кадра без рамок: scale(..., force_original_aspect_ratio=increase) + crop + setsar/setdar.
+    16:9 -> 1920x1080, DAR=16/9; 9:16 -> 1080x1920, DAR=9/16.
+    Аудио копируем как есть. Работает на любых сборках FFmpeg.
     """
     src = _ensure_path(src_path)
     dst = _ensure_path(dst_path)
     has_aud = _has_audio(src)
 
-    if aspect == "16:9":
-        # Экранируем запятые в if()/gte() для ffmpeg (иначе они считаются разделителями аргументов фильтра).
-        w_expr = r"floor(if(gte(iw/ih\,16/9)\,ih*16/9\,iw)/2)*2"
-        h_expr = r"floor(if(gte(iw/ih\,16/9)\,ih\,iw*9/16)/2)*2"
-        scale_part = "scale=1920:1080"
-    elif aspect == "9:16":
-        w_expr = r"floor(if(gte(iw/ih\,9/16)\,ih*9/16\,iw)/2)*2"
-        h_expr = r"floor(if(gte(iw/ih\,9/16)\,ih\,iw*16/9)/2)*2"
-        scale_part = "scale=1080:1920"
+    if aspect == "9:16":
+        target_w, target_h = 1080, 1920
+        dar = "9/16"
     else:
-        raise ValueError("Unsupported aspect ratio. Use '16:9' or '9:16'.")
+        target_w, target_h = 1920, 1080
+        dar = "16/9"
 
-    # crop по расчётным выражениям → формат → финальный жёсткий scale
     vf = (
-        f"crop={w_expr}:{h_expr}:(iw-{w_expr})/2:(ih-{h_expr})/2,"
-        f"format=yuv420p,{scale_part}"
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h},"
+        f"setsar=1,setdar={dar},format=yuv420p"
     )
 
     cmd = [
-        _ffmpeg_path(),
-        "-y",
+        _ffmpeg_path(), "-y",
         "-i", src,
         "-vf", vf,
         "-c:v", "libx264",
@@ -422,11 +447,43 @@ def enforce_ar_no_bars(src_path: str | Path, dst_path: str | Path, aspect: str) 
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
     ]
-
     if has_aud:
         cmd += ["-c:a", "copy"]
     else:
         cmd += ["-an"]
+    cmd += [dst]
+    _run_sync(cmd)
 
+
+def build_vertical_blurpad(src_path: str | Path, dst_path: str | Path) -> None:
+    """
+    Формирует вертикальный ролик 1080x1920 с размытым фоном (TikTok/Reels style).
+    Внутри кадра контент масштабируется по высоте (без чёрных полос) и центрируется.
+    """
+    src = _ensure_path(src_path)
+    dst = _ensure_path(dst_path)
+    has_aud = _has_audio(src)
+
+    filter_complex = (
+        "[0:v]scale=1080:1920,boxblur=20:1[bg];"
+        "[0:v]scale=-2:1920[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,setdar=9/16,format=yuv420p[vout]"
+    )
+
+    cmd = [
+        _ffmpeg_path(), "-y",
+        "-i", src,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-c:v", "libx264",
+        "-crf", str(DEFAULT_CRF),
+        "-preset", DEFAULT_PRESET,
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+    ]
+    if has_aud:
+        cmd += ["-map", "0:a?", "-c:a", "copy"]
+    else:
+        cmd += ["-an"]
     cmd += [dst]
     _run_sync(cmd)

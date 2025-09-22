@@ -22,6 +22,7 @@ def _coalesce_env(*names: str, default: str = "") -> str:
             return v.strip()
     return default
 
+
 def _parse_admin_ids(raw: object) -> Set[int]:
     """
     Универсальный парсер ADMIN_USER_IDS:
@@ -71,6 +72,7 @@ def _parse_admin_ids(raw: object) -> Set[int]:
 
     return ids
 
+
 def _resolve_executable(p: str, fallback: str) -> str:
     """
     Если задан абсолютный/относительный путь к .exe — норм.
@@ -84,6 +86,7 @@ def _resolve_executable(p: str, fallback: str) -> str:
     # Нормализуем слэши
     p = str(Path(p))
     return p
+
 
 # ---------- Совместимость по токенам ----------
 
@@ -138,6 +141,11 @@ class Settings(BaseModel):
     FFMPEG_PATH: str = Field(default_factory=lambda: _resolve_executable(os.getenv("FFMPEG_PATH", ""), "ffmpeg"))
     FFPROBE_PATH: str = Field(default_factory=lambda: _resolve_executable(os.getenv("FFPROBE_PATH", ""), "ffprobe"))
 
+    # Доп. настройки кодека/логирования для media_tools (опционально)
+    VIDEO_CRF: int = int(os.getenv("VIDEO_CRF", 18))
+    FFMPEG_PRESET: str = os.getenv("FFMPEG_PRESET", "slow")
+    FFMPEG_LOG_CMD: bool = os.getenv("FFMPEG_LOG_CMD", "0").lower() in ("1", "true", "yes")
+
     # ---------- Утилиты ----------
     def admin_ids(self) -> Set[int]:
         """Возвращает множество admin user ids (надёжный парсинг из .env/окружения)."""
@@ -161,3 +169,19 @@ class Settings(BaseModel):
 
 
 settings = Settings()
+
+# --------- Экспорт переменных окружения для совместимости ---------
+# Некоторые библиотеки и наши утилиты (services/media_tools.py) читают переменные
+# окружения напрямую. Подставим значения из Settings, если они ещё не заданы.
+
+if not os.getenv("FFMPEG_PATH") and settings.FFMPEG_PATH:
+    os.environ["FFMPEG_PATH"] = settings.FFMPEG_PATH
+
+if not os.getenv("FFPROBE_PATH") and settings.FFPROBE_PATH:
+    os.environ["FFPROBE_PATH"] = settings.FFPROBE_PATH
+
+# SDK Google может ожидать GOOGLE_API_KEY в окружении
+if not os.getenv("GEMINI_API_KEY") and settings.GEMINI_API_KEY:
+    os.environ["GEMINI_API_KEY"] = settings.GEMINI_API_KEY
+if not os.getenv("GOOGLE_API_KEY") and settings.GEMINI_API_KEY:
+    os.environ["GOOGLE_API_KEY"] = settings.GEMINI_API_KEY

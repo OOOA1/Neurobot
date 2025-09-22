@@ -48,7 +48,7 @@ class Veo3Provider(VideoProvider):
     name = Provider.VEO3
 
     def __init__(self) -> None:
-        api_key = settings.GEMINI_API_KEY
+        api_key = getattr(settings, "GEMINI_API_KEY", None)
         if not api_key:
             log.warning("GEMINI_API_KEY is missing; Veo3 submissions will fail")
         self._api_key: Optional[str] = api_key or None
@@ -61,8 +61,8 @@ class Veo3Provider(VideoProvider):
     # ------------ SUBMIT ------------
     async def create_job(self, params: GenerationParams) -> JobId:
         """
-        Photo→video: через SDK (google-genai), sync в отдельном треде.
-        Text→video: через REST API.
+        Photo→video: SDK (google-genai) — синхронный вызов в отдельном треде.
+        Text→video: REST (predictLongRunning) — БЕЗ передачи imageBytes (эта ветка не поддерживает).
         """
         api_key = self._ensure_key()
 
@@ -81,7 +81,6 @@ class Veo3Provider(VideoProvider):
         image_mime = getattr(params, "image_mime", None)
         if not image_bytes:
             ref_url = None
-            # extras может содержать reference_file_id как URL (в твоём пайплайне ты его иногда передаёшь)
             if params.extras and isinstance(params.extras, dict):
                 ref_url = params.extras.get("reference_url") or params.extras.get("reference_file_id")
             if isinstance(ref_url, str) and ref_url.startswith(("http://", "https://")):
@@ -104,11 +103,18 @@ class Veo3Provider(VideoProvider):
             v = (val or "").strip()
             return v if v in {"16:9", "9:16"} else "16:9"
 
-        def _map_resolution(res: Optional[str]) -> str:
+        def _map_resolution(res: Optional[str], aspect: str) -> str:
+            """
+            В Gemini API 1080p гарантирован для 16:9; при 9:16 используем 720p.
+            Если пользователь просит 1080p при 9:16 — принудительно 720p (без ошибок).
+            """
+            ar_eff = _map_ar(aspect)
+            if ar_eff == "9:16":
+                return "720p"
             if not res:
                 return "1080p"
             r = str(res).lower().rstrip("p")
-            return "720p" if r.startswith("720") else "1080p"
+            return "1080p" if r.startswith("1080") else "720p"
 
         anti_borders = (
             "no device frame, no smartphone frame, no UI mockup, "
@@ -117,35 +123,40 @@ class Veo3Provider(VideoProvider):
         )
 
         def _strong_ar_prompt(prompt: str, aspect: str, user_neg: Optional[str]) -> str:
-            # добавляем мягкие ограничения на ориентацию и отсутствие рамок
+            # мягко усиливаем ориентацию и отсутствие рамок
             if aspect == "9:16":
                 tail = f"(VERTICAL 9:16 FULL-FRAME, {anti_borders}, not landscape, not 16:9)"
             else:
                 tail = f"(WIDESCREEN 16:9 FULL-FRAME, {anti_borders}, not vertical, not 9:16)"
             merged_neg = (user_neg.strip() + ", " + anti_borders) if user_neg else anti_borders
-            # избегаем двойной точки
             body = prompt if prompt.endswith((".", "!", "?")) else prompt + "."
             return f"{body} {tail}. Avoid: {merged_neg}."
 
-        negative_prompt = (getattr(params, "negative_prompt", None) or None)
+        extras = params.extras if isinstance(params.extras, dict) else {}
+        negative_prompt = (getattr(params, "negative_prompt", None) or extras.get("negative_prompt") or None)
         duration_seconds = getattr(params, "duration_seconds", None)
+        if duration_seconds is None:
+            duration_seconds = extras.get("duration_seconds")
         seed = getattr(params, "seed", None)
+        if seed is None:
+            seed = extras.get("seed")
 
         # --------- ПУТЬ 1: есть картинка → SDK (google-genai) ---------
         if image_bytes:
             try:
                 from google import genai
+                from google.genai import types as genai_types
             except Exception as exc:
                 raise RuntimeError(
-                    "Photo→video через REST не поддерживается. "
-                    "Установи 'google-genai' (pip install google-genai)."
+                    "Photo→video через REST не поддерживается этой моделью. "
+                    "Установи пакет 'google-genai' (pip install google-genai) для SDK."
                 ) from exc
 
             client = genai.Client(api_key=api_key)
 
             gv_kwargs: dict[str, Any] = {
                 "aspect_ratio": _map_ar(ar),
-                "resolution": _map_resolution(desired_resolution),
+                "resolution": _map_resolution(desired_resolution, ar),
             }
             if negative_prompt:
                 gv_kwargs["negative_prompt"] = negative_prompt
@@ -163,7 +174,7 @@ class Veo3Provider(VideoProvider):
                 model=model_name,
                 prompt=prompt_for_sdk,
                 image=image_obj,
-                config=gv_kwargs or None,
+                config=genai_types.GenerateVideosConfig(**gv_kwargs) if gv_kwargs else None,
             )
             op_name = getattr(operation, "name", None) or getattr(operation, "operation", None)
             if not op_name:
@@ -172,39 +183,55 @@ class Veo3Provider(VideoProvider):
             return op_name
 
         # --------- ПУТЬ 2: текст → REST API (predictLongRunning) ---------
+        # NB: Никаких imageBytes/медиа не отправляем в этой ветке.
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": api_key,
         }
         url_lro = f"{_API_BASE}/models/{model_name}:predictLongRunning"
 
-        config: dict[str, Any] = {
+        # Правильная схема для REST: instances[] + parameters{}
+        parameters: dict[str, Any] = {
             "aspectRatio": _map_ar(ar),
-            "resolution": _map_resolution(desired_resolution),
+            "resolution": _map_resolution(desired_resolution, ar),
+            # Ровным счётом это опционально, но явно разрешим генерацию людей в text→video,
+            # чтобы снизить неожиданные блокировки (см. доку по Veo 3).
+            "personGeneration": "allow_all",
         }
         if negative_prompt:
-            config["negativePrompt"] = negative_prompt
+            parameters["negativePrompt"] = negative_prompt
         if duration_seconds:
-            config["durationSeconds"] = int(duration_seconds)
+            parameters["durationSeconds"] = int(duration_seconds)
         if seed is not None:
-            config["seed"] = int(seed)
+            parameters["seed"] = int(seed)
 
         prompt_text = _strong_ar_prompt(base_prompt, ar, negative_prompt) if strict_ar else base_prompt
-        payload_cfg = {
+        payload = {
             "instances": [
                 {
                     "prompt": prompt_text,
-                    "config": config,
                 }
-            ]
+            ],
+            "parameters": parameters,
         }
 
         # один-два ретрая на сабмит
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as http:
-                    r = await http.post(url_lro, headers=headers, json=payload_cfg)
+                    r = await http.post(url_lro, headers=headers, json=payload)
                 if r.status_code >= 400:
+                    # распространённые ошибки схемы полезно подсветить в логе
+                    if r.status_code == 400:
+                        txt = (r.text or "").strip()
+                        if "Unknown name" in txt and ("contents" in txt or "generationConfig" in txt):
+                            log.error("REST 400: payload must use instances[] + parameters{}, not contents/generationConfig")
+                        if "imageBytes" in txt:
+                            log.error("REST 400: imageBytes isn't supported by this model via REST")
+                            raise RuntimeError(
+                                "Photo→video через REST не поддерживается (imageBytes). "
+                                "Нужно использовать SDK (google-genai)."
+                            )
                     if _is_transient_status(r.status_code) and attempt < 2:
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
@@ -280,30 +307,31 @@ class Veo3Provider(VideoProvider):
         short_id = str(job_id).split("/")[-1]
         sanitized = _SANITIZE_JOB_ID.sub("_", short_id)
         target = Path.cwd() / f"veo3_{int(time.time())}_{sanitized}.mp4"
-        # На всякий случай создадим родительскую папку (обычно это CWD)
         target.parent.mkdir(parents=True, exist_ok=True)
 
         headers = {"x-goog-api-key": self._ensure_key()}
 
-        # несколько попыток на скачивание, с редиректами
+        # несколько попыток на скачивание, stream + tmp → rename (атомарнее, не едим память)
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(180.0),
+                    timeout=httpx.Timeout(300.0),
                     follow_redirects=True,
                     headers=headers,
                 ) as http:
-                    r = await http.get(video_url)
-                    if r.status_code >= 400:
-                        if _is_transient_status(r.status_code) and attempt < 2:
-                            await asyncio.sleep(1.5 * (attempt + 1))
-                            continue
-                        r.raise_for_status()
-                    # пишем атомарнее (через tmp), чтобы не оставлять битые файлы
-                    tmp = target.with_suffix(".tmp")
-                    tmp.write_bytes(r.content)
-                    tmp.replace(target)
-                    return target
+                    async with http.stream("GET", video_url) as resp:
+                        if resp.status_code >= 400:
+                            if _is_transient_status(resp.status_code) and attempt < 2:
+                                await asyncio.sleep(1.5 * (attempt + 1))
+                                continue
+                            resp.raise_for_status()
+                        tmp = target.with_suffix(".tmp")
+                        with tmp.open("wb") as f:
+                            async for chunk in resp.aiter_bytes(64 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                        tmp.replace(target)
+                        return target
             except _TRANSIENT_ERRORS as exc:
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))
@@ -335,8 +363,8 @@ class Veo3Provider(VideoProvider):
         """
         Извлекаем ссылку на видео из ответа LRO:
         - response.generateVideoResponse.generatedSamples[0].video.uri | downloadUri
-        - иногда бывает response.video or response.uri
-        - в редких случаях — files API url в response.resources
+        - response.video / response.uri
+        - response.resources[*].uri
         """
         resp = data.get("response") or {}
 

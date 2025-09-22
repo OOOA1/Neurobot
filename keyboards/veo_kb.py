@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import Mapping
@@ -10,70 +10,70 @@ StateDict = Mapping[str, object]
 
 
 def _mark(label: str, *, selected: bool) -> str:
-    return f"✅ {label}" if selected else label
+    # Без эмодзи, чтобы не было "??" на некоторых клиентах
+    return f"[✓] {label}" if selected else label
+
+
+def _norm_mode(val: object) -> str:
+    v = (str(val or "quality")).lower()
+    return "fast" if v == "fast" else "quality"
 
 
 def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    prompt_present = bool(state.get("prompt"))
-    reference_present = bool(state.get("reference_file_id") or state.get("reference_url"))
-    ar = (state.get("ar") or "16:9").lower()
-    mode = (state.get("mode") or "quality").lower()
+    prompt_present = bool(str(state.get("prompt") or "").strip())
+    reference_present = bool(
+        state.get("reference_file_id")
+        or state.get("reference_url")
+        or state.get("image_bytes")
+    )
+
+    ar_val = (state.get("ar") or "16:9")
+    ar = str(ar_val).strip().lower()  # '16:9' | '9:16'
+    mode = _norm_mode(state.get("mode"))
 
     # Верхний ряд: референс и ввод промпта
     builder.row(
         InlineKeyboardButton(
-            text=_mark("🖼️ Референс", selected=reference_present),
+            text=_mark("Референс", selected=reference_present),
             callback_data="veo:ref:attach",
         ),
         InlineKeyboardButton(
-            text=_mark("✍️ Промт", selected=prompt_present),
+            text=_mark("Промт", selected=prompt_present),
             callback_data="veo:prompt:input",
         ),
     )
+    if reference_present:
+        builder.row(InlineKeyboardButton(text="Убрать референс", callback_data="veo:ref:clear"))
 
-    # Только 16:9 и 9:16 (1:1 полностью убран)
+    # Только 16:9 и 9:16
     builder.row(
-        InlineKeyboardButton(
-            text=_mark("16:9", selected=(ar == "16:9")),
-            callback_data="veo:ar:16_9",
-        ),
-        InlineKeyboardButton(
-            text=_mark("9:16", selected=(ar == "9:16")),
-            callback_data="veo:ar:9_16",
-        ),
+        InlineKeyboardButton(text=_mark("16:9", selected=(ar == "16:9")), callback_data="veo:ar:16_9"),
+        InlineKeyboardButton(text=_mark("9:16", selected=(ar == "9:16")), callback_data="veo:ar:9_16"),
     )
 
-    # Выбор режима
+    # Режим
     builder.row(
-        InlineKeyboardButton(
-            text=_mark("Quality", selected=(mode == "quality")),
-            callback_data="veo:mode:quality",
-        ),
-        InlineKeyboardButton(
-            text=_mark("Fast", selected=(mode == "fast")),
-            callback_data="veo:mode:fast",
-        ),
+        InlineKeyboardButton(text=_mark("Quality", selected=(mode == "quality")), callback_data="veo:mode:quality"),
+        InlineKeyboardButton(text=_mark("Fast", selected=(mode == "fast")), callback_data="veo:mode:fast"),
     )
 
     # Действия
+    ar_label = "16:9" if ar == "16:9" else "9:16"
+    builder.row(InlineKeyboardButton(text=f"Сгенерировать ({ar_label})", callback_data="veo:generate"))
     builder.row(
-        InlineKeyboardButton(text="🚀 Сгенерировать", callback_data="veo:generate"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="🔁 Сброс", callback_data="veo:reset"),
-        InlineKeyboardButton(text="◀️ Назад", callback_data="veo:back"),
+        InlineKeyboardButton(text="Сброс", callback_data="veo:reset"),
+        InlineKeyboardButton(text="Назад", callback_data="veo:back"),
     )
 
     return builder.as_markup()
 
 
 def veo_post_gen_kb() -> InlineKeyboardMarkup:
-    """Клавиатура под готовым видео."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔁 Сгенерировать ещё", callback_data="menu:video:veo")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:back")],
+            [InlineKeyboardButton(text="Сгенерировать ещё", callback_data="menu:video:veo")],
+            [InlineKeyboardButton(text="Главное меню", callback_data="menu:back")],
         ]
     )
