@@ -27,7 +27,7 @@ from db import (
     get_user_balance,
     charge_user_tokens,
     refund_user_tokens,
-    GENERATION_COST_TOKENS,
+    GENERATION_COST_TOKENS,  # оставляю импорт для совместимости, но не используем
 )
 from keyboards.main_menu_kb import main_menu_kb, balance_kb_placeholder
 from keyboards.veo_kb import veo_options_kb, veo_post_gen_kb
@@ -71,6 +71,29 @@ VEO_DEFAULT_STATE: dict[str, Any] = {
 SUMMARY_META_KEY = "veo_summary_message"
 DATA_KEY = "veo_state"
 
+# ---- стоимость (из settings / .env, с дефолтами) ----
+def _veo_costs() -> tuple[float, float]:
+    fast = getattr(settings, "VEO_COST_FAST_TOKENS", None)
+    qual = getattr(settings, "VEO_COST_QUALITY_TOKENS", None)
+    if fast is None:
+        fast = float(os.getenv("VEO_COST_FAST_TOKENS", "2.0"))
+    if qual is None:
+        qual = float(os.getenv("VEO_COST_QUALITY_TOKENS", "10.0"))
+    try:
+        fast = float(fast)
+    except Exception:
+        fast = 2.0
+    try:
+        qual = float(qual)
+    except Exception:
+        qual = 10.0
+    return float(fast), float(qual)
+
+def _current_cost(state: dict[str, Any]) -> float:
+    fast, qual = _veo_costs()
+    mode = (state.get("mode") or "quality").lower()
+    return fast if mode == "fast" else qual
+
 def _not_modified(exc: TelegramBadRequest) -> bool:
     return "message is not modified" in str(exc).lower()
 
@@ -98,19 +121,40 @@ async def _get_summary_meta(state: FSMContext) -> dict[str, Any] | None:
         return meta
     return None
 
-# -------- summary text (без «референс file_id/байты») --------
+# -------- summary text (человечный, с эмодзи и стоимостью) --------
 def _render_summary(state: dict[str, Any]) -> str:
-    prompt = state.get("prompt") or "—"
-    aspect = state.get("ar") or "—"
+    prompt = (state.get("prompt") or "").strip()
+    has_ref = bool(state.get("reference_file_id") or state.get("reference_url") or state.get("image_bytes"))
+    ar = (state.get("ar") or "16:9")
     mode = (state.get("mode") or "quality").lower()
-    mode_label = "Быстро" if mode == "fast" else "Качество"
-    lines = [
-        "🎬 Veo3 генерация",
-        f"Промт: {prompt}",
-        f"Соотношение сторон: {aspect}",
-        f"Режим: {mode_label}",
-        "Настройте параметры кнопками ниже.",
-    ]
+    mode_label = "Fast ⚡" if mode == "fast" else "Quality 🎬"
+    cost = _current_cost(state)
+
+    # стартовый экран — когда ничего ещё не задано
+    if not prompt and not has_ref:
+        return (
+            "🚀 Режим генерации активирован. Пришлите промпт или фото, затем нажмите «Сгенерировать»."
+        )
+
+    # «полная» сводка
+    lines: list[str] = []
+    if prompt:
+        lines.append("✍️ Промпт:")
+        lines.append(prompt)
+    else:
+        lines.append("✍️ Промпт: —")
+
+    lines.append(f"\n🖼 Референс: {'добавлен' if has_ref else '—'}")
+
+    # параметры
+    ar_icon = "📱" if ar == "9:16" else "🖥️"
+    lines.append("\n🧩 Параметры генерации:")
+    lines.append(f"• Формат: {ar} {ar_icon}")
+    lines.append(f"• Режим: {mode_label}")
+    lines.append(f"• Промпт: {'есть 💪' if prompt else 'нет —'}")
+    lines.append(f"• Референс: {'есть 🖼' if has_ref else 'нет —'}")
+    lines.append(f"• Стоимость: {cost:.1f} токена(ов) 💰")
+
     return "\n".join(lines)
 
 async def _edit_summary(*, message: Message | None, bot, state: FSMContext, data: dict[str, Any]) -> None:
@@ -241,6 +285,48 @@ async def _normalize_result(src: Path, aspect: str) -> Path:
         log.exception("output normalization failed: %s", exc)
         return src
 
+# ---------- НОВОЕ: прямой ввод в summary ----------
+@router.message(VeoWizardStates.summary, F.text)
+async def veo_summary_text_input(msg: Message, state: FSMContext) -> None:
+    # игнорируем команды
+    if (msg.text or "").strip().startswith("/"):
+        return
+    text = (msg.text or "").strip()
+    if not text:
+        return
+    moderation = check_text(text)
+    if not moderation.allow:
+        await msg.answer(f"Промт отклонён модерацией: {moderation.reason}")
+        return
+    data = await _update_data(state, prompt=text)
+    await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
+
+@router.message(VeoWizardStates.summary, F.photo | (F.document & (F.document.mime_type.startswith("image/"))))
+async def veo_summary_image_input(msg: Message, state: FSMContext) -> None:
+    file_id: str | None = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file_id = msg.document.file_id
+    if not file_id:
+        return
+    url = await _file_id_to_url(msg.bot, file_id)
+    img_bytes: Optional[bytes] = None
+    img_mime: Optional[str] = None
+    if url:
+        fetched_bytes, fetched_mime = await _fetch_image_bytes(url)
+        if fetched_bytes and fetched_mime:
+            img_bytes, img_mime = fetched_bytes, fetched_mime
+    data = await _update_data(
+        state,
+        reference_file_id=file_id,
+        reference_url=url,
+        image_bytes=img_bytes,
+        image_mime=img_mime,
+    )
+    await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
+
+# ---------- Клавиатурные колбэки ----------
 @router.callback_query(F.data.startswith("veo:"))
 async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
     message = cb.message
@@ -274,7 +360,6 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "neg" and value == "toggle":
-        # кнопки нет — но обработчик оставим безопасным
         enabled = not bool(data.get("negative_enabled"))
         data = await _update_data(state, negative_enabled=enabled)
         await cb.answer("Negative prompt: Вкл" if enabled else "Negative prompt: Выкл")
@@ -309,11 +394,15 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
     if action == "generate":
         prompt = (data.get("prompt") or "").strip()
         aspect = data.get("ar")
-        if not prompt or not aspect:
-            await cb.answer("Укажите промт (✍️ Промт) и соотношение сторон (16:9 / 9:16)", show_alert=True)
+        has_ref = bool(data.get("image_bytes") or data.get("reference_url") or data.get("reference_file_id"))
+        if (not prompt) and (not has_ref):
+            await cb.answer("Добавьте промпт или референс", show_alert=True)
+            return
+        if not aspect:
+            await cb.answer("Выберите соотношение сторон (16:9 / 9:16)", show_alert=True)
             return
 
-        resolution_first = 1080  # всегда 1080p (провайдер сам понизит до 720p для 9:16)
+        resolution_first = 1080  # провайдер сам понизит до 720p для 9:16
         reference_file_id = data.get("reference_file_id")
         reference_url = data.get("reference_url")
         mode = (data.get("mode") or "quality").lower()
@@ -325,18 +414,21 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             await _prepare(db)
             await ensure_user(db, cb.from_user.id, cb.from_user.username, settings.FREE_TOKENS_ON_JOIN)
 
+        # динамическая стоимость
+        expected_cost = _current_cost(data)
+
         if not is_admin:
             async with connect() as db:
                 await _prepare(db)
                 bal = await get_user_balance(db, cb.from_user.id)
-            if bal < GENERATION_COST_TOKENS:
+            if bal < expected_cost:
                 await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
                 await cb.answer(); return
 
         if not is_admin:
             async with connect() as db:
                 await _prepare(db)
-                charged = await charge_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+                charged = await charge_user_tokens(db, cb.from_user.id, expected_cost)
             if not charged:
                 await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
                 await cb.answer(); return
@@ -371,7 +463,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             if not is_admin:
                 async with connect() as db:
                     await _prepare(db)
-                    await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+                    await refund_user_tokens(db, cb.from_user.id, expected_cost)
             log.exception("Veo3 submit failed: %s", exc)
             txt = str(exc).lower()
             if "resource_exhausted" in txt or "quota" in txt or "rate limit" in txt:
@@ -393,7 +485,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             if not is_admin:
                 async with connect() as db:
                     await _prepare(db)
-                    await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+                    await refund_user_tokens(db, cb.from_user.id, expected_cost)
             await status_message.edit_text(first_status.error or "Генерация завершилась с ошибкой")
             return
 
@@ -410,7 +502,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             if not is_admin:
                 async with connect() as db:
                     await _prepare(db)
-                    await refund_user_tokens(db, cb.from_user.id, GENERATION_COST_TOKENS)
+                    await refund_user_tokens(db, cb.from_user.id, expected_cost)
             await status_message.edit_text("Не удалось скачать видео")
             return
 
@@ -523,6 +615,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
 
     await cb.answer()
 
+# ----- старые ручки (по кнопкам) оставил как есть -----
 @router.message(VeoWizardStates.prompt_input)
 async def prompt_input(msg: Message, state: FSMContext) -> None:
     text = (msg.text or "").strip()
@@ -579,7 +672,7 @@ async def reference_input(msg: Message, state: FSMContext) -> None:
 async def reference_input_invalid(msg: Message) -> None:
     await msg.answer("Пришлите изображение в качестве референса")
 
-# --------------- Luma ---------------
+# --------------- Luma (без изменений значимой логики) ---------------
 class LumaWizardStates(StatesGroup):
     summary = State()
     prompt_input = State()

@@ -10,8 +10,11 @@ StateDict = Mapping[str, object]
 
 
 def _mark(label: str, *, selected: bool) -> str:
-    # Без эмодзи, чтобы не было "??" на некоторых клиентах
-    return f"[✓] {label}" if selected else label
+    """
+    Помечаем выбранные пункты в тексте кнопки.
+    Используем '✅' в конце, чтобы визуально не мешало основному лейблу.
+    """
+    return f"{label} ✅" if selected else label
 
 
 def _norm_mode(val: object) -> str:
@@ -33,21 +36,26 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
     ar = str(ar_val).strip().lower()  # '16:9' | '9:16'
     mode = _norm_mode(state.get("mode"))
 
-    # Верхний ряд: референс и ввод промпта
+    # ВЕРХНИЕ ШИРОКИЕ КНОПКИ (каждая на своей строке — размер меню стабильный)
     builder.row(
         InlineKeyboardButton(
-            text=_mark("Референс", selected=reference_present),
+            text=("🔁 Референс" if reference_present else "🖼 Референс"),
             callback_data="veo:ref:attach",
-        ),
-        InlineKeyboardButton(
-            text=_mark("Промт", selected=prompt_present),
-            callback_data="veo:prompt:input",
-        ),
+        )
     )
-    if reference_present:
-        builder.row(InlineKeyboardButton(text="Убрать референс", callback_data="veo:ref:clear"))
+    builder.row(
+        InlineKeyboardButton(
+            text=("🔁 Изменить промпт" if prompt_present else "📝 Добавить промпт"),
+            callback_data="veo:prompt:input",
+        )
+    )
 
-    # Только 16:9 и 9:16
+    if reference_present:
+        builder.row(
+            InlineKeyboardButton(text="❌ Убрать референс", callback_data="veo:ref:clear")
+        )
+
+    # Соотношение сторон
     builder.row(
         InlineKeyboardButton(text=_mark("16:9", selected=(ar == "16:9")), callback_data="veo:ar:16_9"),
         InlineKeyboardButton(text=_mark("9:16", selected=(ar == "9:16")), callback_data="veo:ar:9_16"),
@@ -55,16 +63,21 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
 
     # Режим
     builder.row(
-        InlineKeyboardButton(text=_mark("Quality", selected=(mode == "quality")), callback_data="veo:mode:quality"),
-        InlineKeyboardButton(text=_mark("Fast", selected=(mode == "fast")), callback_data="veo:mode:fast"),
+        InlineKeyboardButton(
+            text=_mark("🎬 Quality", selected=(mode == "quality")),
+            callback_data="veo:mode:quality",
+        ),
+        InlineKeyboardButton(
+            text=_mark("⚡ Fast", selected=(mode == "fast")),
+            callback_data="veo:mode:fast",
+        ),
     )
 
     # Действия
-    ar_label = "16:9" if ar == "16:9" else "9:16"
-    builder.row(InlineKeyboardButton(text=f"Сгенерировать ({ar_label})", callback_data="veo:generate"))
+    builder.row(InlineKeyboardButton(text="🚀 Сгенерировать", callback_data="veo:generate"))
     builder.row(
-        InlineKeyboardButton(text="Сброс", callback_data="veo:reset"),
-        InlineKeyboardButton(text="Назад", callback_data="veo:back"),
+        InlineKeyboardButton(text="🔄 Начать заново", callback_data="veo:reset"),
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="veo:back"),
     )
 
     return builder.as_markup()
@@ -73,7 +86,7 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
 def veo_post_gen_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Сгенерировать ещё", callback_data="menu:video:veo")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu:back")],
+            [InlineKeyboardButton(text="🚀 Сгенерировать ещё", callback_data="menu:video:veo")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:back")],
         ]
     )
