@@ -6,7 +6,7 @@ import os
 import tempfile
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import asyncio
 import httpx
@@ -41,6 +41,7 @@ from services.media_tools import (
     probe_video,
     build_intro_from_image,
     concat_with_crossfade,
+    enforce_ar_no_bars,  # 🔹 ДОБАВЛЕНО: анти-рамки
 )
 from texts import WELCOME, INSUFFICIENT_TOKENS
 
@@ -70,6 +71,8 @@ VEO_DEFAULT_STATE: dict[str, Any] = {
     "mode": "quality",
     "reference_file_id": None,   # Telegram file_id фото-референса
     "reference_url": None,       # кэшируем прямой URL для постпроцессинга
+    "image_bytes": None,         # 🔹 сырые байты изображения (для photo->video)
+    "image_mime": None,          # 🔹 mime типа "image/jpeg" | "image/png"
 }
 
 SUMMARY_META_KEY = "veo_summary_message"
@@ -114,13 +117,14 @@ def _render_summary(state: dict[str, Any]) -> str:
     mode = (state.get("mode") or "quality").lower()
     mode_label = "Быстро" if mode == "fast" else "Качество"
     ref_present = "да" if state.get("reference_file_id") else "нет"
+    img_present = "да" if state.get("image_bytes") else "нет"
     lines = [
         "🎬 Veo3 генерация",
         f"Промт: {prompt}",
         f"Соотношение сторон: {aspect}",
-        # строка «Разрешение» убрана
         f"Режим: {mode_label}",
-        f"Референс: {ref_present}",
+        f"Референс (file_id): {ref_present}",
+        f"Референс-байты: {img_present}",
         "Настройте параметры кнопками ниже.",
     ]
     return "\n".join(lines)
@@ -220,6 +224,36 @@ async def _file_id_to_url(bot, file_id: str) -> str | None:
         return None
 
 
+async def _fetch_image_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Скачиваем изображение и пытаемся определить корректный MIME.
+    Возвращаем (bytes, mime) или (None, None) при ошибке.
+    """
+    if not url:
+        return None, None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            raw = resp.content
+            mime = resp.headers.get("content-type", "").split(";")[0].strip().lower() or None
+            # небольшой sanity check
+            if not mime or not mime.startswith("image/"):
+                # fallback по расширению
+                lower = url.lower()
+                if lower.endswith(".png"):
+                    mime = "image/png"
+                elif lower.endswith(".jpg") or lower.endswith(".jpeg"):
+                    mime = "image/jpeg"
+                else:
+                    # дефолт: jpeg
+                    mime = "image/jpeg"
+            return raw, mime
+    except Exception as exc:
+        log.exception("Failed to fetch image bytes: %s", exc)
+        return None, None
+
+
 async def _stitch_if_needed(reference_url: str | None, video_path: Path) -> Path:
     """
     Если есть reference_url — делаем короткое интро из фото и кроссфейд к сгенерённому видео.
@@ -263,6 +297,22 @@ async def _stitch_if_needed(reference_url: str | None, video_path: Path) -> Path
         return video_path
 
 
+# 🔹 НОВОЕ: единый helper для удаления чёрных полос
+def _fix_letterbox(src: Path, aspect: str) -> Path:
+    """
+    Прогоняет видео через enforce_ar_no_bars, чтобы убрать чёрные поля.
+    Возвращает путь к обработанному файлу, либо исходный при ошибке.
+    """
+    try:
+        dst = src.with_name(src.stem + "_fixed.mp4")
+        # Функция синхронная — обрабатываем и возвращаем результат
+        enforce_ar_no_bars(str(src), str(dst), aspect)
+        return dst if dst.exists() else src
+    except Exception as exc:
+        log.exception("enforce_ar_no_bars failed: %s", exc)
+        return src
+
+
 @router.callback_query(F.data.startswith("veo:"))
 async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
     message = cb.message
@@ -275,7 +325,8 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
     action, value = _parse_callback(cb.data)
     data = await _get_data(state)
     if action == "ar":
-        mapping = {"16_9": "16:9", "9_16": "9:16", "1_1": "1:1"}
+        # только два варианта AR
+        mapping = {"16_9": "16:9", "9_16": "9:16"}
         chosen = mapping.get(value or "")
         if chosen:
             data = await _update_data(state, ar=chosen)
@@ -318,7 +369,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(VeoWizardStates.reference_input)
         return
     if action == "ref" and value == "clear":
-        data = await _update_data(state, reference_file_id=None, reference_url=None)
+        data = await _update_data(state, reference_file_id=None, reference_url=None, image_bytes=None, image_mime=None)
         await cb.answer("Референс удалён")
         await _edit_summary(message=message, bot=message.bot, state=state, data=data)
         return
@@ -329,13 +380,11 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             await cb.answer("Укажите промт (✍️ Промт) и соотношение сторон (16:9 / 9:16)", show_alert=True)
             return
 
-        # Определяем разрешение автоматически:
-        # - если есть референс ИЛИ аспект 9:16 → 720p
-        # - иначе → 1080p
+        # Всегда 1080p (логика разрешений здесь не трогаем — цель только убрать полосы)
+        resolution_first = 1080
+
         reference_file_id = data.get("reference_file_id")
         reference_url = data.get("reference_url")
-        has_reference = bool(reference_file_id or reference_url)
-        resolution_first = 720 if has_reference or aspect == "9:16" else 1080
 
         # Режим и negative
         mode = (data.get("mode") or "quality").lower()
@@ -373,12 +422,24 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         status_message = await message.answer("Генерация началась")
 
         try:
-            ref_value = reference_url or reference_file_id or None
+            ref_value = (reference_url or reference_file_id) or None
 
-            # Строгий режим только для «нестандартных» AR (вертикаль/квадрат)
-            strict = aspect in {"9:16", "1:1"}
+            # Пытаемся достать байты/миме из стейта (если пользователь присылал фото)
+            image_bytes: Optional[bytes] = data.get("image_bytes")
+            image_mime: Optional[str] = data.get("image_mime")
 
-            # ---------- Первый рендер (auto 720/1080) ----------
+            # Если в стейте нет байтов, но есть URL — попробуем скачать на лету
+            if (not image_bytes) and reference_url:
+                fetched_bytes, fetched_mime = await _fetch_image_bytes(reference_url)
+                if fetched_bytes and fetched_mime:
+                    image_bytes, image_mime = fetched_bytes, fetched_mime
+                    # одновременно обновим состояние, чтобы второй проход не скачивал повторно
+                    await _update_data(state, image_bytes=image_bytes, image_mime=image_mime)
+
+            # Всегда строгий AR
+            strict = True
+
+            # ---------- Первый рендер (1080п + strict_ar=True) ----------
             job_id_first = await generation_service.create_video(
                 provider="veo3",
                 prompt=prompt,
@@ -387,7 +448,9 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 negative_prompt=negative_prompt,
                 fast=(mode == "fast"),
                 reference_file_id=ref_value,
-                strict_ar=strict,  # ключ к нативному AR
+                strict_ar=strict,
+                image_bytes=image_bytes,
+                image_mime=image_mime,
             )
         except Exception as exc:
             if not is_admin:
@@ -439,6 +502,8 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
 
         # Постпроцесс (интро из фото) — если есть reference_url
         to_send_first = await _stitch_if_needed(reference_url, Path(video_path_first))
+        # 🔹 Удаляем чёрные полосы
+        to_send_first_fixed = _fix_letterbox(Path(to_send_first), aspect)
 
         # Остаток баланса для подписи
         caption_first = "Ваше видео сгенерировано. Спасибо что пользуетесь нашим ботом"
@@ -451,23 +516,26 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         # Отправляем первое видео + клавиатуру «ещё / главное меню»
         try:
             await message.answer_video(
-                video=FSInputFile(to_send_first),
+                video=FSInputFile(to_send_first_fixed),
                 caption=caption_first,
                 reply_markup=veo_post_gen_kb(),
             )
         finally:
             with suppress(OSError):
                 os.remove(video_path_first)
-            if to_send_first != Path(video_path_first):
+            if Path(to_send_first) != Path(video_path_first):
                 with suppress(OSError):
                     os.remove(to_send_first)
+            if Path(to_send_first_fixed) not in (Path(video_path_first), Path(to_send_first)):
+                with suppress(OSError):
+                    os.remove(to_send_first_fixed)
 
-        # Если референса нет — завершаем как раньше (одинарный рендер)
-        if not has_reference:
+        # ---------- Второй рендер (HQ) оставлен как раньше (опционален) ----------
+        reference_present = bool(reference_file_id or reference_url)
+        if not reference_present:
             await status_message.edit_text("Видео отправлено")
             return
 
-        # ---------- Второй рендер: HQ 1080п как «Оригинал (HQ)» ----------
         try:
             job_id_hq = await generation_service.create_video(
                 provider="veo3",
@@ -478,6 +546,8 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 fast=(mode == "fast"),
                 reference_file_id=ref_value,
                 strict_ar=strict,
+                image_bytes=data.get("image_bytes"),
+                image_mime=data.get("image_mime"),
             )
         except Exception as exc:
             log.exception("Veo3 submit (HQ) failed: %s", exc)
@@ -499,14 +569,20 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             return
 
         to_send_hq = await _stitch_if_needed(reference_url, Path(video_path_hq))
+        # 🔹 Удаляем чёрные полосы (HQ)
+        to_send_hq_fixed = _fix_letterbox(Path(to_send_hq), aspect)
+
         try:
-            await message.answer_video(video=FSInputFile(to_send_hq), caption="Оригинал (HQ)")
+            await message.answer_video(video=FSInputFile(to_send_hq_fixed), caption="Оригинал (HQ)")
         finally:
             with suppress(OSError):
                 os.remove(video_path_hq)
-            if to_send_hq != Path(video_path_hq):
+            if Path(to_send_hq) != Path(video_path_hq):
                 with suppress(OSError):
                     os.remove(to_send_hq)
+            if Path(to_send_hq_fixed) not in (Path(video_path_hq), Path(to_send_hq)):
+                with suppress(OSError):
+                    os.remove(to_send_hq_fixed)
 
         await status_message.edit_text("Видео отправлено")
         return
@@ -562,7 +638,8 @@ async def negative_input(msg: Message, state: FSMContext) -> None:
 async def reference_input(msg: Message, state: FSMContext) -> None:
     """
     Принимаем фото-референс как Photo или как документ-изображение.
-    Сразу пытаемся получить прямой URL и сохраняем его (для постпроцессинга).
+    Сразу пытаемся получить прямой URL, а также скачать байты + определить MIME
+    (для передачи в Veo как imageBytes/mimeType).
     """
     file_id: str | None = None
     if msg.photo:
@@ -575,7 +652,21 @@ async def reference_input(msg: Message, state: FSMContext) -> None:
         return
 
     url = await _file_id_to_url(msg.bot, file_id)
-    data = await _update_data(state, reference_file_id=file_id, reference_url=url)
+    img_bytes: Optional[bytes] = None
+    img_mime: Optional[str] = None
+
+    if url:
+        fetched_bytes, fetched_mime = await _fetch_image_bytes(url)
+        if fetched_bytes and fetched_mime:
+            img_bytes, img_mime = fetched_bytes, fetched_mime
+
+    data = await _update_data(
+        state,
+        reference_file_id=file_id,
+        reference_url=url,
+        image_bytes=img_bytes,
+        image_mime=img_mime,
+    )
     await state.set_state(VeoWizardStates.summary)
     await _edit_summary(message=None, bot=msg.bot, state=state, data=data)
     await msg.answer("Референс сохранён")
@@ -776,11 +867,11 @@ async def luma_callback(cb: CallbackQuery, state: FSMContext) -> None:
 async def luma_prompt_input(msg: Message, state: FSMContext) -> None:
     text = (msg.text or "").strip()
     if not text:
-        await msg.answer("Промпт не может быть пустым, попробуйте снова.")
+        await msg.answer("Промт не может быть пустым, попробуйте снова.")
         return
     moderation = check_text(text)
     if not moderation.allow:
-        await msg.answer(f"Промпт отклонён модерацией: {moderation.reason}")
+        await msg.answer(f"Промт отклонён модерацией: {moderation.reason}")
         return
     data = await _luma_update_data(state, prompt=text)
     await state.set_state(LumaWizardStates.summary)

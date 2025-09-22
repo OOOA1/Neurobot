@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import base64
+import asyncio
 import logging
 import mimetypes
 import re
@@ -10,15 +10,38 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from httpx import TimeoutException
+from httpx import (
+    HTTPError,
+    TimeoutException,
+    RemoteProtocolError,
+    ConnectError,
+    ReadTimeout,
+    ProxyError,
+)
 
 from config import settings
 from providers.base import JobId, JobStatus, Provider, VideoProvider
 from providers.models import GenerationParams
 
 log = logging.getLogger("providers.veo3_provider")
-_SANITIZE_JOB_ID = re.compile(r"[^a-zA-Z0-9_-]+")
+
+# НЕ допускаем слэши в имени файла, только буквы/цифры/._-
+_SANITIZE_JOB_ID = re.compile(r"[^a-zA-Z0-9._-]+")
 _API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+# сетевые ошибки, которые считаем временными и ретраим
+_TRANSIENT_ERRORS = (
+    TimeoutException,
+    RemoteProtocolError,
+    ConnectError,
+    ReadTimeout,
+    ProxyError,
+)
+
+
+def _is_transient_status(status_code: int) -> bool:
+    # 5xx, 425/429/499 — временные
+    return status_code >= 500 or status_code in (425, 429, 499)
 
 
 class Veo3Provider(VideoProvider):
@@ -35,58 +58,57 @@ class Veo3Provider(VideoProvider):
             raise RuntimeError("GEMINI_API_KEY is not configured")
         return self._api_key
 
-    # ------------ SUBMIT (REST) ------------
+    # ------------ SUBMIT ------------
     async def create_job(self, params: GenerationParams) -> JobId:
         """
-        Отправка задачи в Veo3 (операция LRO).
-
-        Режимы:
-        - Обычный: пробуем instances[0].config (aspectRatio / resolution / negativePrompt).
-          Если модель не поддерживает config (400 INVALID_ARGUMENT) — повторяем без config,
-          но усиливаем промпт (full-frame 9:16 и пр.).
-        - strict_ar: всегда пропускаем config и сразу шлём усиленный промпт,
-          чтобы максимально жёстко удержать нужный формат.
+        Photo→video: через SDK (google-genai), sync в отдельном треде.
+        Text→video: через REST API.
         """
         api_key = self._ensure_key()
-        model_name = params.model or (
-            "veo-3.0-fast-generate-001" if params.fast_mode else "veo-3.0-generate-001"
-        )
-        qparams = {"key": api_key}
 
-        # ---- Базовый промпт / аспект ----
         base_prompt = (params.prompt or "").strip()
-        ar = (params.aspect_ratio or "").strip()
-        strict_ar = bool((params.extras or {}).get("strict_ar"))
+        ar = (params.aspect_ratio or "16:9").strip()
+        strict_ar = bool(getattr(params, "strict_ar", False))
 
-        # ---- Референс (inlineData) ----
-        image_obj: dict[str, Any] | None = None
-        ref = (params.extras or {}).get("reference_file_id") if params.extras else None
-        if isinstance(ref, str) and ref.startswith(("http://", "https://")):
-            try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
-                    rimg = await http.get(ref)
-                    rimg.raise_for_status()
-                    img_bytes = rimg.content
-                mime = (mimetypes.guess_type(ref)[0]) or "image/jpeg"
-                b64 = base64.b64encode(img_bytes).decode("ascii")
-                image_obj = {"inlineData": {"mimeType": mime, "data": b64}}
-            except Exception as exc:
-                log.exception("Failed to fetch reference image: %s", exc)
-                image_obj = None
+        # поддержка и params.fast, и params.fast_mode
+        fast_flag = getattr(params, "fast", None)
+        if fast_flag is None:
+            fast_flag = getattr(params, "fast_mode", False)
+        desired_resolution = getattr(params, "resolution", None) or "1080p"
 
+        # --- собрать байты картинки, если есть (fallback по URL) ---
+        image_bytes = getattr(params, "image_bytes", None)
+        image_mime = getattr(params, "image_mime", None)
+        if not image_bytes:
+            ref_url = None
+            # extras может содержать reference_file_id как URL (в твоём пайплайне ты его иногда передаёшь)
+            if params.extras and isinstance(params.extras, dict):
+                ref_url = params.extras.get("reference_url") or params.extras.get("reference_file_id")
+            if isinstance(ref_url, str) and ref_url.startswith(("http://", "https://")):
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
+                        rimg = await http.get(ref_url)
+                        rimg.raise_for_status()
+                        image_bytes = rimg.content
+                    image_mime = (mimetypes.guess_type(ref_url)[0]) or "image/jpeg"
+                except Exception as exc:
+                    log.exception("Failed to fetch reference image: %s", exc)
+
+        # --- выбор модели ---
+        model_name = params.model or (
+            "veo-3.0-fast-generate-001" if fast_flag else "veo-3.0-generate-001"
+        )
+
+        # --- утилиты ---
         def _map_ar(val: str) -> str:
             v = (val or "").strip()
-            return v if v in {"16:9", "9:16", "1:1"} else "16:9"
+            return v if v in {"16:9", "9:16"} else "16:9"
 
-        def _map_resolution(res: Optional[str]) -> Optional[str]:
+        def _map_resolution(res: Optional[str]) -> str:
             if not res:
-                return None
-            r = str(res).lower().rstrip("p")
-            if r in {"720", "720p"}:
-                return "720p"
-            if r in {"1080", "1080p"}:
                 return "1080p"
-            return None
+            r = str(res).lower().rstrip("p")
+            return "720p" if r.startswith("720") else "1080p"
 
         anti_borders = (
             "no device frame, no smartphone frame, no UI mockup, "
@@ -94,274 +116,259 @@ class Veo3Provider(VideoProvider):
             "edge-to-edge content, fill the entire frame"
         )
 
-        def _strong_ar_prompt(prompt: str, aspect: str, resolution_hint: Optional[str], user_neg: Optional[str]) -> str:
-            rh = (resolution_hint or "").lower().rstrip("p")
-            res_int = 1080 if rh == "1080" else 720  # дефолт 720
-
+        def _strong_ar_prompt(prompt: str, aspect: str, user_neg: Optional[str]) -> str:
+            # добавляем мягкие ограничения на ориентацию и отсутствие рамок
             if aspect == "9:16":
-                w, h = (720, 1280) if res_int <= 720 else (1080, 1920)
-                tail = (
-                    f" (VERTICAL 9:16 FULL-FRAME, portrait composition, {w}x{h}, {anti_borders}, "
-                    f"not landscape, not widescreen, not 16:9)"
-                )
-            elif aspect == "1:1":
-                s = 1080 if res_int >= 1080 else 720
-                tail = (
-                    f" (SQUARE 1:1 FULL-FRAME, {s}x{s}, {anti_borders}, "
-                    f"not landscape, not widescreen, not 16:9, not 9:16)"
-                )
+                tail = f"(VERTICAL 9:16 FULL-FRAME, {anti_borders}, not landscape, not 16:9)"
             else:
-                w, h = (1280, 720) if res_int <= 720 else (1920, 1080)
-                tail = (
-                    f" (WIDESCREEN 16:9 FULL-FRAME, landscape composition, {w}x{h}, {anti_borders}, "
-                    f"not vertical, not portrait, not 9:16, not 1:1)"
-                )
-
+                tail = f"(WIDESCREEN 16:9 FULL-FRAME, {anti_borders}, not vertical, not 9:16)"
             merged_neg = (user_neg.strip() + ", " + anti_borders) if user_neg else anti_borders
-            return prompt + tail + f". Avoid: {merged_neg}."
+            # избегаем двойной точки
+            body = prompt if prompt.endswith((".", "!", "?")) else prompt + "."
+            return f"{body} {tail}. Avoid: {merged_neg}."
 
-        headers = {"Content-Type": "application/json"}
-        url_lro = f"{_API_BASE}/models/{model_name}:predictLongRunning"
+        negative_prompt = (getattr(params, "negative_prompt", None) or None)
+        duration_seconds = getattr(params, "duration_seconds", None)
+        seed = getattr(params, "seed", None)
 
-        # ---------- Строгий режим: сразу шлём усиленный промпт (без config) ----------
-        if strict_ar:
-            prompt_strict = _strong_ar_prompt(base_prompt, ar, params.resolution, params.negative_prompt)
-            instance_fb: dict[str, Any] = {"prompt": prompt_strict}
-            if image_obj:
-                instance_fb["image"] = image_obj
-            payload_fb: dict[str, Any] = {"instances": [instance_fb]}
+        # --------- ПУТЬ 1: есть картинка → SDK (google-genai) ---------
+        if image_bytes:
+            try:
+                from google import genai
+            except Exception as exc:
+                raise RuntimeError(
+                    "Photo→video через REST не поддерживается. "
+                    "Установи 'google-genai' (pip install google-genai)."
+                ) from exc
 
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as http:
-                r2 = await http.post(url_lro, params=qparams, headers=headers, json=payload_fb)
+            client = genai.Client(api_key=api_key)
 
-            if r2.status_code >= 400:
-                log.error("Veo3 submit (strict) failed %s %s\nBody: %s", r2.status_code, r2.reason_phrase, r2.text)
-                raise RuntimeError("Veo3 submission failed")
+            gv_kwargs: dict[str, Any] = {
+                "aspect_ratio": _map_ar(ar),
+                "resolution": _map_resolution(desired_resolution),
+            }
+            if negative_prompt:
+                gv_kwargs["negative_prompt"] = negative_prompt
+            if duration_seconds:
+                gv_kwargs["duration_seconds"] = int(duration_seconds)
+            if seed is not None:
+                gv_kwargs["seed"] = int(seed)
 
-            data2 = r2.json()
-            op_name2 = data2.get("name")
-            if not op_name2:
-                log.error("Veo3 submit strict ok but no operation name. Body: %s", data2)
-                raise RuntimeError("Veo3 submission succeeded but no operation name returned")
-            log.info("Google Veo operation (strict) started: %s", op_name2)
-            return op_name2
+            prompt_for_sdk = base_prompt if not strict_ar else _strong_ar_prompt(base_prompt, ar, negative_prompt)
+            image_obj = {"image_bytes": image_bytes, "mime_type": image_mime or "image/jpeg"}
 
-        # ---------- Попытка №1: с config ----------
-        config: dict[str, Any] = {"aspectRatio": _map_ar(ar)}
-        res = _map_resolution(params.resolution)
-        if res:
-            config["resolution"] = res
-        if params.negative_prompt:
-            config["negativePrompt"] = params.negative_prompt
-
-        # Мягкий текстовый префикс (доп. сигнал ориентации)
-        prompt_cfg = base_prompt
-        if ar == "9:16":
-            prompt_cfg = (
-                "VERTICAL 9:16 full-frame video. Edge-to-edge content. "
-                "No device/phone frame, no borders/letterboxing/pillarboxing. "
-            ) + prompt_cfg
-        elif ar == "1:1":
-            prompt_cfg = (
-                "SQUARE 1:1 full-frame video. Edge-to-edge content. "
-                "No borders/letterboxing/pillarboxing. "
-            ) + prompt_cfg
-
-        instance_cfg: dict[str, Any] = {"prompt": prompt_cfg, "config": config}
-        if image_obj:
-            instance_cfg["image"] = image_obj
-
-        payload_cfg: dict[str, Any] = {"instances": [instance_cfg]}
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as http:
-            r = await http.post(url_lro, params=qparams, headers=headers, json=payload_cfg)
-
-        # Если всё ок — возвращаем operation name
-        if r.status_code < 400:
-            data = r.json()
-            op_name = data.get("name")
+            # SDK синхронный — гоняем в отдельном треде
+            operation = await asyncio.to_thread(
+                client.models.generate_videos,
+                model=model_name,
+                prompt=prompt_for_sdk,
+                image=image_obj,
+                config=gv_kwargs or None,
+            )
+            op_name = getattr(operation, "name", None) or getattr(operation, "operation", None)
             if not op_name:
-                log.error("Veo3 submit ok but no operation name. Body: %s", data)
-                raise RuntimeError("Veo3 submission succeeded but no operation name returned")
-            log.info("Google Veo operation started: %s", op_name)
+                raise RuntimeError("Veo3 SDK returned no operation name")
+            log.info("Google Veo operation (SDK-sync) started: %s", op_name)
             return op_name
 
-        # Если модель не поддерживает config — повторяем без него (fallback)
-        body_text = r.text
-        msg = body_text.lower()
-        config_unsupported = (
-            "`config` isn't supported" in body_text
-            or "config isn't supported" in msg
-            or "unknown field \"config\"" in msg
-            or ("invalid_argument" in msg and "config" in msg)
-        )
-        if not config_unsupported:
-            log.error("Veo3 submit failed %s %s\nBody: %s", r.status_code, r.reason_phrase, body_text)
-            raise RuntimeError("Veo3 submission failed")
+        # --------- ПУТЬ 2: текст → REST API (predictLongRunning) ---------
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        }
+        url_lro = f"{_API_BASE}/models/{model_name}:predictLongRunning"
 
-        # ---------- Попытка №2: без config, но с ЖЁСТКИМ AR-хинтом ----------
-        prompt_fallback = _strong_ar_prompt(base_prompt, ar, params.resolution, params.negative_prompt)
+        config: dict[str, Any] = {
+            "aspectRatio": _map_ar(ar),
+            "resolution": _map_resolution(desired_resolution),
+        }
+        if negative_prompt:
+            config["negativePrompt"] = negative_prompt
+        if duration_seconds:
+            config["durationSeconds"] = int(duration_seconds)
+        if seed is not None:
+            config["seed"] = int(seed)
 
-        instance_fb: dict[str, Any] = {"prompt": prompt_fallback}
-        if image_obj:
-            instance_fb["image"] = image_obj
-        payload_fb: dict[str, Any] = {"instances": [instance_fb]}
+        prompt_text = _strong_ar_prompt(base_prompt, ar, negative_prompt) if strict_ar else base_prompt
+        payload_cfg = {
+            "instances": [
+                {
+                    "prompt": prompt_text,
+                    "config": config,
+                }
+            ]
+        }
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as http:
-            r2 = await http.post(url_lro, params=qparams, headers=headers, json=payload_fb)
+        # один-два ретрая на сабмит
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as http:
+                    r = await http.post(url_lro, headers=headers, json=payload_cfg)
+                if r.status_code >= 400:
+                    if _is_transient_status(r.status_code) and attempt < 2:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    log.error("Veo3 submit failed %s %s\nBody: %s", r.status_code, r.reason_phrase, r.text)
+                    raise RuntimeError("Veo3 submission failed")
+                data = r.json()
+                op_name = data.get("name") or data.get("operation")
+                if not op_name:
+                    raise RuntimeError("Veo3 submission succeeded but no operation name")
+                log.info("Google Veo operation started: %s", op_name)
+                return op_name
+            except _TRANSIENT_ERRORS as exc:
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Veo3 submission transport error: {exc}") from exc
 
-        if r2.status_code >= 400:
-            log.error("Veo3 submit (fallback) failed %s %s\nBody: %s", r2.status_code, r2.reason_phrase, r2.text)
-            raise RuntimeError("Veo3 submission failed")
+        # теоретически недостижимо
+        raise RuntimeError("Veo3 submission failed after retries")
 
-        data2 = r2.json()
-        op_name2 = data2.get("name")
-        if not op_name2:
-            log.error("Veo3 submit fallback ok but no operation name. Body: %s", data2)
-            raise RuntimeError("Veo3 submission succeeded but no operation name returned")
-        log.info("Google Veo operation (fallback) started: %s", op_name2)
-        return op_name2
-
-    async def create_video(
-        self,
-        *,
-        prompt: str,
-        aspect_ratio: str,
-        resolution: int,
-        negative_prompt: str | None = None,
-        fast: bool = False,
-        reference_file_id: str | None = None,
-        strict_ar: bool = False,  # <--- новый параметр
-    ) -> JobId:
-        # resolution/negativePrompt/AR прокидываются в submit
-        extras: dict[str, Any] = {}
-        if reference_file_id:
-            extras["reference_file_id"] = reference_file_id
-        if strict_ar:
-            extras["strict_ar"] = True
-
-        params = GenerationParams(
-            prompt=prompt,
-            provider=Provider.VEO3,
-            aspect_ratio=aspect_ratio,
-            resolution=f"{resolution}p",
-            negative_prompt=negative_prompt,
-            fast_mode=fast,
-            extras=extras or None,
-        )
-        return await self.create_job(params)
-
-    # ------------ POLL (REST operations/<id>) ------------
+    # ------------ POLL ------------
     async def poll(self, job_id: JobId) -> JobStatus:
         api_key = self._ensure_key()
         url = f"{_API_BASE}/{job_id}"
-        qparams = {"key": api_key}
+        headers = {"x-goog-api-key": api_key}
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
-            r = await http.get(url, params=qparams)
-            if r.status_code >= 400:
-                log.error("Veo3 poll failed %s %s\nBody: %s", r.status_code, r.reason_phrase, r.text)
-                return JobStatus(status="failed", error="Veo3 poll failed")
-
-            data = r.json()
+        # лёгкие ретраи, чтобы не срывать весь пайплайн из-за единичного сбоя
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
+                    r = await http.get(url, headers=headers)
+                if r.status_code >= 400:
+                    if _is_transient_status(r.status_code) and attempt < 1:
+                        await asyncio.sleep(1.0)
+                        continue
+                    return JobStatus(status="failed", error=f"Veo3 poll failed ({r.status_code})")
+                data = r.json()
+                break
+            except _TRANSIENT_ERRORS as exc:
+                if attempt < 1:
+                    await asyncio.sleep(1.0)
+                    continue
+                return JobStatus(status="pending", error=str(exc))
+        else:
+            return JobStatus(status="pending")
 
         done = bool(data.get("done"))
         metadata = data.get("metadata") or {}
         progress = self._extract_progress(metadata)
 
         if not done:
-            return JobStatus(status="running" if progress else "pending", progress=progress, extra={"operation": data})
+            return JobStatus(status="running" if progress else "pending", progress=progress)
 
         error = data.get("error")
         if error:
             message = error.get("message") if isinstance(error, dict) else str(error)
-            return JobStatus(status="failed", progress=progress, error=message, extra={"operation": data})
+            return JobStatus(status="failed", progress=progress, error=message or "generation failed")
 
         video_url = self._extract_video_uri(data)
         if not video_url:
-            return JobStatus(status="failed", progress=progress, error="No video URL returned", extra={"operation": data})
+            return JobStatus(status="failed", progress=progress, error="No video URL returned")
 
-        return JobStatus(status="succeeded", progress=100, extra={"operation": data, "video_url": video_url})
+        return JobStatus(status="succeeded", progress=100, extra={"video_url": video_url})
 
-    # ------------ DOWNLOAD (HTTP GET uri) ------------
+    # ------------ DOWNLOAD ------------
     async def download(self, job_id: JobId) -> Path:
         status = await self.poll(job_id)
-        video_url = (status.extra or {}).get("video_url") if status.extra else None
+        video_url = (status.extra or {}).get("video_url")
         if status.status != "succeeded" or not video_url:
             raise RuntimeError("Veo3 download called before generation finished")
 
-        sanitized = _SANITIZE_JOB_ID.sub("_", job_id)
+        # Берём только хвост operation id (последний сегмент) и санитизируем
+        short_id = str(job_id).split("/")[-1]
+        sanitized = _SANITIZE_JOB_ID.sub("_", short_id)
         target = Path.cwd() / f"veo3_{int(time.time())}_{sanitized}.mp4"
+        # На всякий случай создадим родительскую папку (обычно это CWD)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
         headers = {"x-goog-api-key": self._ensure_key()}
 
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(180.0), follow_redirects=True, headers=headers) as http:
-                r = await http.get(video_url)
-                r.raise_for_status()
-        except TimeoutException as exc:
-            log.exception("Veo3 download timeout: %s", exc)
-            raise RuntimeError("Veo3 download timed out") from exc
-        except httpx.HTTPError as exc:
-            log.exception("Veo3 download HTTP error: %s | Body: %s", exc, getattr(exc.response, "text", ""))
-            raise RuntimeError("Veo3 download failed") from exc
+        # несколько попыток на скачивание, с редиректами
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(180.0),
+                    follow_redirects=True,
+                    headers=headers,
+                ) as http:
+                    r = await http.get(video_url)
+                    if r.status_code >= 400:
+                        if _is_transient_status(r.status_code) and attempt < 2:
+                            await asyncio.sleep(1.5 * (attempt + 1))
+                            continue
+                        r.raise_for_status()
+                    # пишем атомарнее (через tmp), чтобы не оставлять битые файлы
+                    tmp = target.with_suffix(".tmp")
+                    tmp.write_bytes(r.content)
+                    tmp.replace(target)
+                    return target
+            except _TRANSIENT_ERRORS as exc:
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError("Veo3 download timed out") from exc
+            except HTTPError as exc:
+                # не-временные сетевые ошибки
+                raise RuntimeError(f"Veo3 download failed: {exc}") from exc
 
-        target.write_bytes(r.content)
-        return target
+        # теоретически недостижимо
+        raise RuntimeError("Veo3 download failed after retries")
 
     # ------------ helpers ------------
     def _extract_progress(self, meta: dict[str, Any]) -> int:
-        for k in ("progress", "progress_percent", "progressPercent", "progress_percentage"):
+        for k in ("progress", "progressPercent", "progress_percentage", "progress_percent"):
             v = meta.get(k)
             if isinstance(v, (int, float)):
-                return int(v)
+                try:
+                    return max(0, min(100, int(v)))
+                except Exception:
+                    pass
+        # иногда в metadata кладут state: "PENDING"/"RUNNING"
+        state = str(meta.get("state") or "").upper()
+        if state == "RUNNING":
+            return 1
         return 0
 
     def _extract_video_uri(self, data: dict[str, Any]) -> str | None:
+        """
+        Извлекаем ссылку на видео из ответа LRO:
+        - response.generateVideoResponse.generatedSamples[0].video.uri | downloadUri
+        - иногда бывает response.video or response.uri
+        - в редких случаях — files API url в response.resources
+        """
         resp = data.get("response") or {}
+
+        # основной ожидаемый формат
         gvr = resp.get("generateVideoResponse") or {}
         samples = gvr.get("generatedSamples") or []
-        if isinstance(samples, list) and samples:
+        if samples:
             video = (samples[0] or {}).get("video") or {}
             uri = video.get("uri") or video.get("downloadUri")
             if uri:
                 return uri
-        gv = resp.get("generated_videos")
-        if isinstance(gv, list) and gv:
-            video = (gv[0] or {}).get("video") or {}
-            uri = video.get("uri") or video.get("download_uri")
+
+        # упрощённые варианты
+        uri = resp.get("uri") or resp.get("downloadUri")
+        if uri:
+            return uri
+
+        video = resp.get("video") or {}
+        if isinstance(video, dict):
+            uri = video.get("uri") or video.get("downloadUri")
             if uri:
                 return uri
+
+        # иногда прилетает files API
+        resources = resp.get("resources") or []
+        for it in resources:
+            if isinstance(it, dict):
+                uri = it.get("uri") or it.get("downloadUri")
+                if uri:
+                    return uri
+
         return None
 
 
 _default_provider = Veo3Provider()
-
-
-async def create_job(
-    prompt: str,
-    aspect_ratio: str,
-    resolution: int | str,
-    *,
-    fast: bool = False,
-    negative_prompt: str | None = None,
-    reference_file_id: str | None = None,
-    strict_ar: bool = False,   # <--- пробрасываем наружу
-) -> JobId:
-    resolution_int = int(str(resolution).rstrip("p"))
-    return await _default_provider.create_video(
-        prompt=prompt,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution_int,
-        negative_prompt=negative_prompt,
-        fast=fast,
-        reference_file_id=reference_file_id,
-        strict_ar=strict_ar,
-    )
-
-
-async def poll(job_id: JobId) -> JobStatus:
-    return await _default_provider.poll(job_id)
-
-
-async def download(job_id: JobId) -> Path:
-    return await _default_provider.download(job_id)

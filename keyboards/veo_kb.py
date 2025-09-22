@@ -21,7 +21,7 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
     ar = (state.get("ar") or "16:9").lower()
     mode = (state.get("mode") or "quality").lower()
 
-    # ВАЖНО: значения для AR с подчёркиванием (а не с двоеточием) — так ждут хендлеры
+    # Верхний ряд: референс и ввод промпта
     builder.row(
         InlineKeyboardButton(
             text=_mark("🖼️ Референс", selected=reference_present),
@@ -33,6 +33,7 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
         ),
     )
 
+    # Только 16:9 и 9:16 (1:1 полностью убран)
     builder.row(
         InlineKeyboardButton(
             text=_mark("16:9", selected=(ar == "16:9")),
@@ -44,8 +45,7 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
         ),
     )
 
-    # Кнопки выбора разрешения (720p/1080p) удалены — теперь оно выбирается автоматически
-
+    # Выбор режима
     builder.row(
         InlineKeyboardButton(
             text=_mark("Quality", selected=(mode == "quality")),
@@ -57,6 +57,7 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
         ),
     )
 
+    # Действия
     builder.row(
         InlineKeyboardButton(text="🚀 Сгенерировать", callback_data="veo:generate"),
     )
@@ -69,11 +70,7 @@ def veo_options_kb(state: StateDict) -> InlineKeyboardMarkup:
 
 
 def veo_post_gen_kb() -> InlineKeyboardMarkup:
-    """
-    Клавиатура, которая показывается под готовым видео:
-    - «Сгенерировать ещё» возвращает в Veo-мастер
-    - «Главное меню» возвращает в главное меню
-    """
+    """Клавиатура под готовым видео."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔁 Сгенерировать ещё", callback_data="menu:video:veo")],

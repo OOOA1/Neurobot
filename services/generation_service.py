@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
-from typing import Callable, Union
+from typing import Callable, Union, Optional
 
 from providers.base import JobId, JobStatus, Provider, VideoProvider
 from providers.models import GenerationParams
 from providers.luma_provider import LumaProvider
 from providers.veo3_provider import Veo3Provider
 
+log = logging.getLogger("services.generation_service")
 
 _PROVIDER_FACTORIES: dict[Provider, Callable[[], VideoProvider]] = {
     Provider.LUMA: LumaProvider,
@@ -52,16 +54,41 @@ async def wait_for_completion(
     *,
     interval_sec: float = 8.0,
     timeout_sec: float = 20 * 60.0,
+    max_retries: int = 3,
 ) -> JobStatus:
-    """Poll provider periodically until job completes or times out."""
+    """
+    Poll provider periodically until job completes or times out.
+    Добавлен retry для временных сетевых ошибок.
+    """
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout_sec
+
+    attempt = 0
     while True:
-        status = await poll_job(provider, job_id)
+        try:
+            status = await poll_job(provider, job_id)
+        except Exception as exc:
+            attempt += 1
+            if attempt <= max_retries:
+                backoff = min(5.0, interval_sec * attempt)
+                log.warning(
+                    "poll_job failed (attempt %s/%s): %s. Retrying in %.1fs",
+                    attempt, max_retries, exc, backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            log.error("poll_job failed permanently after %s retries: %s", max_retries, exc)
+            return JobStatus(status="failed", error=str(exc))
+
+        # сброс счётчика после успешного poll
+        attempt = 0
+
         if status.status in {"succeeded", "failed"}:
             return status
+
         if loop.time() > deadline:
             return JobStatus(status="failed", error="timeout")
+
         await asyncio.sleep(interval_sec)
 
 
@@ -74,37 +101,52 @@ async def create_video(
     provider: str,
     prompt: str,
     aspect_ratio: str,
-    resolution: int,
-    negative_prompt: str | None = None,
+    resolution: Union[int, str],
+    negative_prompt: Optional[str] = None,
     fast: bool = False,
-    reference_file_id: str | None = None,
-    strict_ar: bool = False,   # <--- добавлено
+    reference_file_id: Optional[str] = None,
+    strict_ar: bool = True,
+    # Новые параметры для photo->video:
+    image_bytes: Optional[bytes] = None,
+    image_mime: Optional[str] = None,  # "image/jpeg" | "image/png"
+    # Дополнительно:
+    seed: Optional[int] = None,
+    duration_seconds: Optional[int] = None,
 ) -> JobId:
     """
     Convenience helper used by the Veo3 wizard.
-    Duration убрана из публичного интерфейса — используется дефолт модели (Veo3).
 
-    reference_file_id может быть как Telegram file_id, так и уже готовым HTTP URL.
-    Провайдер Veo3 сам разберётся, как это использовать.
+    Теперь умеет принимать сырые байты изображения (image_bytes) и их mime (image_mime).
+    Если также указан reference_file_id (URL/Gemini files/локальный путь), провайдер решит,
+    чем именно воспользоваться: приоритет обычно за image_bytes/image_mime.
     """
     provider_enum = _to_provider_enum(provider)
     if provider_enum is not Provider.VEO3:
         raise ValueError(f"Unsupported provider for video creation: {provider_enum}")
 
-    provider_impl = get_provider(provider_enum)
-    if not isinstance(provider_impl, Veo3Provider):
-        raise RuntimeError("Configured provider is not Veo3Provider")
+    # Нормализуем resolution
+    if isinstance(resolution, int):
+        resolution_str = f"{resolution}p"
+    else:
+        resolution_str = str(resolution).lower()
+        if not resolution_str.endswith("p"):
+            resolution_str += "p"
 
-    # Прокидываем все параметры напрямую. Жёсткое соблюдение AR управляется strict_ar.
-    return await provider_impl.create_video(
+    params = GenerationParams(
         prompt=prompt.strip(),
+        provider=provider_enum,
         aspect_ratio=aspect_ratio,
-        resolution=resolution,
+        resolution=resolution_str,
         negative_prompt=negative_prompt,
-        fast=fast,
-        reference_file_id=reference_file_id,
-        strict_ar=strict_ar,   # <--- прокинуто
+        fast_mode=fast,
+        image_bytes=image_bytes,
+        image_mime=image_mime,
+        seed=seed,
+        duration_seconds=duration_seconds,
+        strict_ar=strict_ar,
+        extras={**({"reference_file_id": reference_file_id} if reference_file_id else {})},
     )
+    return await create_job(params)
 
 
 async def poll_video(provider: str, job_id: JobId) -> JobStatus:
