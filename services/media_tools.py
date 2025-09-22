@@ -10,9 +10,8 @@ services/media_tools.py
 - build_intro_from_image: сделать короткий mp4 из картинки нужного размера (cover: без паддингов)
 - concat_two: склеить интро и основное видео без перехода (только видео)
 - concat_with_crossfade: склеить с плавным переходом (кроссфейд), сохранить аудио из второго клипа (если есть)
-- enforce_ar_no_bars: убрать чёрные поля (letterbox) кропом под заданное соотношение сторон,
-  привести к точному размеру и зафиксировать SAR/DAR (исключает полосы в плеерах)
-- build_vertical_blurpad: сформировать вертикальный 1080x1920 канвас с размытым фоном (как Reels/TikTok)
+- enforce_ar_no_bars: нормализация без чёрных полос (включая «впаянные» letterbox)
+- build_vertical_blurpad: вертикальный 1080x1920 с размытой подложкой (как Reels/TikTok)
 """
 
 import asyncio
@@ -22,7 +21,7 @@ import shutil
 import subprocess
 import math
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 # -------- настройки качества (можно переопределить в .env) --------
 DEFAULT_CRF = int(os.getenv("VIDEO_CRF", "18"))
@@ -40,7 +39,6 @@ def _ensure_path(p: str | Path) -> str:
     """Преобразует путь к строке для ffmpeg/ffprobe (поддержка Path)."""
     return str(Path(p))
 
-
 def _normalize_env_path(value: str | None, name: str) -> str | None:
     """
     Нормализует путь из env:
@@ -50,12 +48,10 @@ def _normalize_env_path(value: str | None, name: str) -> str | None:
     """
     if not value:
         return None
-    # Убираем возможные кавычки из .env
     p = Path(value.strip('"').strip("'"))
     if p.is_file():
         return str(p)
     if p.is_dir():
-        # подставим имя бинарника (учтём .exe на Windows)
         bin_name = name
         if os.name == "nt" and not bin_name.lower().endswith(".exe"):
             bin_name += ".exe"
@@ -64,23 +60,20 @@ def _normalize_env_path(value: str | None, name: str) -> str | None:
             return str(candidate)
     return None
 
-
 def _bin_path(name: str, env_var: str) -> str:
     """
     Возвращает путь к бинарнику name (ffmpeg/ffprobe).
     1) Берём из переменной окружения env_var (поддерживает путь к файлу или директории).
     2) Ищем в PATH через shutil.which.
     3) Пробуем типичные пути Windows.
-    Если не найден — вернём просто имя (пусть subprocess попробует),
+    Если не найден — возвращаем просто имя (пусть subprocess попробует),
     а в случае ошибки дадим понятное сообщение.
     """
-    # 1) Переменная окружения
     env_val = os.environ.get(env_var)
     p_env = _normalize_env_path(env_val, name)
     if p_env:
         return p_env
 
-    # 2) PATH
     p2 = shutil.which(name)
     if p2:
         return p2
@@ -89,28 +82,19 @@ def _bin_path(name: str, env_var: str) -> str:
         if p2:
             return p2
 
-    # 3) Типичные Windows пути
     if os.name == "nt":
-        base_candidates = [
-            r"C:\ffmpeg\bin",
-            r"C:\Program Files\ffmpeg\bin",
-            r"C:\Program Files (x86)\ffmpeg\bin",
-        ]
-        for base in base_candidates:
+        for base in (r"C:\ffmpeg\bin", r"C:\Program Files\ffmpeg\bin", r"C:\Program Files (x86)\ffmpeg\bin"):
             candidate = Path(base) / (name if name.lower().endswith(".exe") else f"{name}.exe")
             if candidate.is_file():
                 return str(candidate)
 
-    return name  # даст шанс subprocess'у; в случае ошибки мы покажем понятный текст
-
+    return name  # даст шанс subprocess'у; в случае ошибки покажем понятный текст
 
 def _ffprobe_path() -> str:
     return _bin_path("ffprobe", "FFPROBE_PATH")
 
-
 def _ffmpeg_path() -> str:
     return _bin_path("ffmpeg", "FFMPEG_PATH")
-
 
 # -------- внутренние синхронные helpers --------
 def _run_sync(cmd: list[str]) -> None:
@@ -121,46 +105,50 @@ def _run_sync(cmd: list[str]) -> None:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except FileNotFoundError as e:
         raise RuntimeError(
-            f"Executable not found: {cmd[0]}\n"
-            f"Проверь .env (FFMPEG_PATH/FFPROBE_PATH) и доступность файла."
+            f"Executable not found: {cmd[0]}\nПроверь .env (FFMPEG_PATH/FFPROBE_PATH) и доступность файла."
         ) from e
 
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr}"
-        )
+        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr}")
 
+def _run_capture(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Запуск команды с возвратом stdout/stderr (для cropdetect и т.п.)."""
+    if LOG_CMD:
+        print("[ffmpeg-capture] CMD:", " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"Executable not found: {cmd[0]}\nПроверь .env (FFMPEG_PATH/FFPROBE_PATH) и доступность файла."
+        ) from e
+    if proc.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} failed:\n{proc.stderr}")
+    return proc
 
 def _run_probe(cmd: list[str]) -> subprocess.CompletedProcess:
-    """Запускает команду probe (ffprobe) и возвращает процесс или кидает понятную ошибку."""
+    """Запускает команду probe (ffprobe)."""
     if LOG_CMD:
         print("[ffprobe] CMD:", " ".join(cmd))
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except FileNotFoundError as e:
         raise RuntimeError(
-            f"Executable not found: {cmd[0]}\n"
-            f"Проверь .env (FFMPEG_PATH/FFPROBE_PATH) и доступность файла."
+            f"Executable not found: {cmd[0]}\nПроверь .env (FFMPEG_PATH/FFPROBE_PATH) и доступность файла."
         ) from e
 
     if proc.returncode != 0:
         raise RuntimeError(f"{cmd[0]} failed:\n{proc.stderr}")
     return proc
 
-
 # -------- вспомогательные проверки --------
 def _has_audio(path: str | Path) -> bool:
-    """
-    Возвращает True, если у файла есть хотя бы один аудиопоток.
-    """
+    """True, если у файла есть хотя бы один аудиопоток."""
     path = _ensure_path(path)
     cmd = [
-        _ffprobe_path(),
-        "-v", "error",
+        _ffprobe_path(), "-v", "error",
         "-select_streams", "a",
         "-show_entries", "stream=index",
-        "-of", "json",
-        path,
+        "-of", "json", path,
     ]
     proc = _run_probe(cmd)
     try:
@@ -170,21 +158,15 @@ def _has_audio(path: str | Path) -> bool:
     streams = (data.get("streams") or [])
     return len(streams) > 0
 
-
 # -------- публичные утилиты --------
 def probe_video(path: str | Path) -> Tuple[int, int, float]:
-    """
-    Возвращает (width, height, fps) первого видеопотока.
-    Использует ffprobe. Бросает RuntimeError при ошибке.
-    """
+    """Возвращает (width, height, fps) первого видеопотока по ffprobe."""
     path = _ensure_path(path)
     cmd = [
-        _ffprobe_path(),
-        "-v", "error",
+        _ffprobe_path(), "-v", "error",
         "-select_streams", "v:0",
         "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate",
-        "-of", "json",
-        path,
+        "-of", "json", path,
     ]
     proc = _run_probe(cmd)
     try:
@@ -199,7 +181,6 @@ def probe_video(path: str | Path) -> Tuple[int, int, float]:
     w = int(st.get("width") or 0)
     h = int(st.get("height") or 0)
 
-    # fps: попробуем r_frame_rate, затем avg_frame_rate
     fr = st.get("r_frame_rate") or st.get("avg_frame_rate") or "25/1"
     try:
         if "/" in fr:
@@ -216,19 +197,13 @@ def probe_video(path: str | Path) -> Tuple[int, int, float]:
         raise RuntimeError(f"Invalid probe result: width={w}, height={h}, fps={fps}")
     return w, h, fps
 
-
 def probe_duration(path: str | Path) -> float:
-    """
-    Возвращает длительность файла (в секундах) по ffprobe.
-    Бросает RuntimeError при ошибке или нулевой длительности.
-    """
+    """Возвращает длительность файла (в секундах) по ffprobe."""
     path = _ensure_path(path)
     cmd = [
-        _ffprobe_path(),
-        "-v", "error",
+        _ffprobe_path(), "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "json",
-        path,
+        "-of", "json", path,
     ]
     proc = _run_probe(cmd)
     try:
@@ -241,7 +216,6 @@ def probe_duration(path: str | Path) -> float:
         raise RuntimeError("Could not determine media duration")
     return dur
 
-
 async def build_intro_from_image(
     image_path: str | Path,
     out_path: str | Path,
@@ -252,11 +226,8 @@ async def build_intro_from_image(
     fps: float = 25.0,
 ) -> None:
     """
-    Делает короткий mp4 из картинки под нужный размер:
-    - масштабирование с «избытком» и кроп под точные размеры (cover: БЕЗ паддингов → без чёрных полос)
-    - фиксирует SAR=1 и DAR (например 16/9 или 9/16)
-    - yuv420p для совместимости
-    - качество: -crf 18, -preset slow (переопределяется переменными)
+    Короткий mp4 из картинки с cover-кропом под точные размеры (без паддингов).
+    Фиксируем SAR/DAR, используем yuv420p.
     """
     image_path = _ensure_path(image_path)
     out_path = _ensure_path(out_path)
@@ -271,8 +242,7 @@ async def build_intro_from_image(
     )
 
     cmd = [
-        _ffmpeg_path(),
-        "-y",
+        _ffmpeg_path(), "-y",
         "-loop", "1",
         "-t", f"{max(0.05, float(duration))}",
         "-i", image_path,
@@ -287,24 +257,14 @@ async def build_intro_from_image(
     ]
     await asyncio.to_thread(_run_sync, cmd)
 
-
-async def concat_two(
-    intro_path: str | Path,
-    video_path: str | Path,
-    out_path: str | Path,
-) -> None:
-    """
-    Склеивает два ролика (видео без аудио) последовательно.
-    Переход — резкий. Для плавного см. concat_with_crossfade.
-    Качество: -crf 18, -preset slow.
-    """
+async def concat_two(intro_path: str | Path, video_path: str | Path, out_path: str | Path) -> None:
+    """Склейка двух роликов без перехода (только видео)."""
     intro_path = _ensure_path(intro_path)
     video_path = _ensure_path(video_path)
     out_path = _ensure_path(out_path)
 
     cmd = [
-        _ffmpeg_path(),
-        "-y",
+        _ffmpeg_path(), "-y",
         "-i", intro_path,
         "-i", video_path,
         "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[outv]",
@@ -318,7 +278,6 @@ async def concat_two(
     ]
     await asyncio.to_thread(_run_sync, cmd)
 
-
 async def concat_with_crossfade(
     intro_path: str | Path,
     video_path: str | Path,
@@ -326,12 +285,7 @@ async def concat_with_crossfade(
     *,
     fade_duration: float = 0.4,
 ) -> None:
-    """
-    Склеивает с плавным переходом (кроссфейд) между концом интро и началом видео.
-    Если у второго клипа нет аудио — сохраняет только видео-дорожку.
-    Оба ролика должны иметь одинаковые параметры (лучше сформировать интро build_intro_from_image).
-    Качество: -crf 18, -preset slow.
-    """
+    """Склейка с кроссфейдом. Если у второго клипа есть звук — переносим его."""
     intro_path = _ensure_path(intro_path)
     video_path = _ensure_path(video_path)
     out_path = _ensure_path(out_path)
@@ -341,21 +295,16 @@ async def concat_with_crossfade(
     offset = max(0.0, intro_dur - fd)
     has_aud = _has_audio(video_path)
 
-    # видео-кроссфейд через xfade
     video_chain = f"[0:v][1:v]xfade=transition=fade:duration={fd}:offset={offset},format=yuv420p[v]"
 
     if has_aud:
-        # у второго клипа есть звук — берём его и задерживаем
         adelay_ms = int(round(offset * 1000))
         filter_complex = f"{video_chain};[1:a]adelay={adelay_ms}|{adelay_ms}[a]"
         cmd = [
-            _ffmpeg_path(),
-            "-y",
-            "-i", intro_path,     # 0
-            "-i", video_path,     # 1
+            _ffmpeg_path(), "-y",
+            "-i", intro_path, "-i", video_path,
             "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-map", "[a]",
+            "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264",
             "-crf", str(DEFAULT_CRF),
             "-preset", DEFAULT_PRESET,
@@ -366,14 +315,10 @@ async def concat_with_crossfade(
             out_path,
         ]
     else:
-        # звука нет — маппим только видео
-        filter_complex = video_chain
         cmd = [
-            _ffmpeg_path(),
-            "-y",
-            "-i", intro_path,
-            "-i", video_path,
-            "-filter_complex", filter_complex,
+            _ffmpeg_path(), "-y",
+            "-i", intro_path, "-i", video_path,
+            "-filter_complex", video_chain,
             "-map", "[v]",
             "-c:v", "libx264",
             "-crf", str(DEFAULT_CRF),
@@ -383,24 +328,21 @@ async def concat_with_crossfade(
             "-shortest",
             out_path,
         ]
-
     await asyncio.to_thread(_run_sync, cmd)
 
-
-# -------- анти-рамки (удаление чёрных полос) --------
-
+# -------- анти-рамки (детект + удаление «впаянных» чёрных полос) --------
 def _parse_crop_from_stderr(stderr: str) -> Tuple[int, int, int, int] | None:
     """
-    Парсит последнюю подсказку вида 'crop=w:h:x:y' из stderr ffmpeg (cropdetect).
-    Возвращает (w, h, x, y) или None.
+    Парсит последнюю подсказку 'crop=w:h:x:y' из stderr ffmpeg (cropdetect).
+    Возвращает (w, h, x, y) либо None.
     """
     last = None
-    for line in (stderr or '').splitlines():
+    for line in (stderr or "").splitlines():
         line = line.strip()
-        if 'crop=' in line:
-            idx = line.rfind('crop=')
-            seg = line[idx + 5 :].strip()
-            parts = seg.split(':')
+        if "crop=" in line:
+            idx = line.rfind("crop=")
+            seg = line[idx + 5:].strip()
+            parts = seg.split(":")
             if len(parts) >= 4:
                 try:
                     cw = int(parts[0]); ch = int(parts[1]); cx = int(parts[2]); cy = int(parts[3])
@@ -409,14 +351,44 @@ def _parse_crop_from_stderr(stderr: str) -> Tuple[int, int, int, int] | None:
                     pass
     return last
 
+def _detect_letterbox_crop(src_path: str | Path, *, sample_frames: int = 120) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Прогоняет cropdetect на первых N кадрах и возвращает подсказку (w,h,x,y),
+    если реально есть «впаянные» чёрные поля (>~2% площади).
+    """
+    src = _ensure_path(src_path)
+    iw, ih, _ = probe_video(src)
+
+    # cropdetect логирует в stderr (info). limit=24 — порог чувствительности.
+    cmd = [
+        _ffmpeg_path(), "-hide_banner", "-v", "info",
+        "-i", src,
+        "-vf", "cropdetect=limit=24:round=2:reset=0",
+        "-frames:v", str(max(30, int(sample_frames))),
+        "-f", "null", "-"
+    ]
+    proc = _run_capture(cmd)
+    hint = _parse_crop_from_stderr(proc.stderr or "")
+    if not hint:
+        return None
+    cw, ch, cx, cy = hint
+
+    # подсказка почти равна исходнику — считаем, что полос нет
+    area_ratio = (cw * ch) / float(iw * ih)
+    if area_ratio >= 0.98:  # <2% экономии — игнорируем
+        return None
+    if cw <= 0 or ch <= 0 or cw > iw or ch > ih:
+        return None
+    return cw, ch, cx, cy
 
 def _even(val: int) -> int:
     return val if val % 2 == 0 else val - 1
 
-
 def enforce_ar_no_bars(src_path: str | Path, dst_path: str | Path, aspect: str) -> None:
     """
-    Нормализация кадра без рамок: scale(..., force_original_aspect_ratio=increase) + crop + setsar/setdar.
+    Нормализация кадра без рамок:
+      1) если внутри есть letterbox — предварительно вырежем его (cropdetect),
+      2) затем cover+crop к целевым размерам и фиксация DAR/SAR.
     16:9 -> 1920x1080, DAR=16/9; 9:16 -> 1080x1920, DAR=9/16.
     Аудио копируем как есть. Работает на любых сборках FFmpeg.
     """
@@ -431,7 +403,19 @@ def enforce_ar_no_bars(src_path: str | Path, dst_path: str | Path, aspect: str) 
         target_w, target_h = 1920, 1080
         dar = "16/9"
 
+    # 1) авто-кроп «впаянных» полос (если есть)
+    pre_crop = ""
+    try:
+        hint = _detect_letterbox_crop(src)
+    except Exception:
+        hint = None
+    if hint:
+        cw, ch, cx, cy = hint
+        pre_crop = f"crop={cw}:{ch}:{cx}:{cy},"
+
+    # 2) нормализация под целевой AR
     vf = (
+        f"{pre_crop}"
         f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
         f"crop={target_w}:{target_h},"
         f"setsar=1,setdar={dar},format=yuv420p"
@@ -454,20 +438,28 @@ def enforce_ar_no_bars(src_path: str | Path, dst_path: str | Path, aspect: str) 
     cmd += [dst]
     _run_sync(cmd)
 
-
 def build_vertical_blurpad(src_path: str | Path, dst_path: str | Path) -> None:
     """
     Формирует вертикальный ролик 1080x1920 с размытым фоном (TikTok/Reels style).
-    Внутри кадра контент масштабируется по высоте (без чёрных полос) и центрируется.
+    Перед тем, как собирать фон/фореграунд, вырезает «впаянные» чёрные полосы (cropdetect).
     """
     src = _ensure_path(src_path)
     dst = _ensure_path(dst_path)
     has_aud = _has_audio(src)
 
+    crop_stage = ""
+    try:
+        hint = _detect_letterbox_crop(src)
+    except Exception:
+        hint = None
+    if hint:
+        cw, ch, cx, cy = hint
+        crop_stage = f"crop={cw}:{ch}:{cx}:{cy},"
+
     filter_complex = (
-        "[0:v]scale=1080:1920,boxblur=20:1[bg];"
-        "[0:v]scale=-2:1920[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,setdar=9/16,format=yuv420p[vout]"
+        f"[0:v]{crop_stage}scale=1080:1920,boxblur=20:1[bg];"
+        f"[0:v]{crop_stage}scale=-2:1920[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,setdar=9/16,format=yuv420p[vout]"
     )
 
     cmd = [

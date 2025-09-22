@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import os
+import random
 import re
 import time
 from pathlib import Path
@@ -38,25 +40,55 @@ _TRANSIENT_ERRORS = (
     ProxyError,
 )
 
-
 def _is_transient_status(status_code: int) -> bool:
     # 5xx, 425/429/499 — временные
     return status_code >= 500 or status_code in (425, 429, 499)
+
+# --- Глобальный мягкий троттлинг сабмитов (чтобы меньше ловить 429) ---
+_submit_lock = asyncio.Lock()
+_last_submit_ts: float = 0.0
+_MIN_SUBMIT_GAP = float(getattr(settings, "GEMINI_MIN_SUBMIT_GAP_S", 0.7))  # сек
+
+async def _respect_submit_gap() -> None:
+    """Гарантируем минимальный зазор между сабмитами в рамках процесса."""
+    global _last_submit_ts
+    async with _submit_lock:
+        now = time.monotonic()
+        wait = _MIN_SUBMIT_GAP - (now - _last_submit_ts)
+        if wait > 0:
+            await asyncio.sleep(wait + random.uniform(0, 0.2))
+        _last_submit_ts = time.monotonic()
 
 
 class Veo3Provider(VideoProvider):
     name = Provider.VEO3
 
     def __init__(self) -> None:
-        api_key = getattr(settings, "GEMINI_API_KEY", None)
+        # ЕДИНЫЙ ключ для SDK и REST: предпочитаем GOOGLE_API_KEY / VEO_API_KEY
+        api_key = (
+            os.getenv("GOOGLE_API_KEY")
+            or os.getenv("VEO_API_KEY")
+            or getattr(settings, "GEMINI_API_KEY", None)
+            or os.getenv("GEMINI_API_KEY")
+        )
         if not api_key:
-            log.warning("GEMINI_API_KEY is missing; Veo3 submissions will fail")
+            log.warning("No API key (GOOGLE_API_KEY/VEO_API_KEY/GEMINI_API_KEY); Veo3 submissions will fail")
         self._api_key: Optional[str] = api_key or None
 
     def _ensure_key(self) -> str:
         if not self._api_key:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
+            raise RuntimeError("Veo API key is not configured")
         return self._api_key
+
+    def _prepare_env_for_sdk(self) -> None:
+        """
+        Перед созданием клиента SDK приводим окружение к одному ключу:
+        - ставим GOOGLE_API_KEY = наш ключ
+        - убираем GEMINI_API_KEY, чтобы SDK не писал warning
+        """
+        if self._api_key:
+            os.environ["GOOGLE_API_KEY"] = self._api_key
+        os.environ.pop("GEMINI_API_KEY", None)
 
     # ------------ SUBMIT ------------
     async def create_job(self, params: GenerationParams) -> JobId:
@@ -143,9 +175,15 @@ class Veo3Provider(VideoProvider):
 
         # --------- ПУТЬ 1: есть картинка → SDK (google-genai) ---------
         if image_bytes:
+            # Сначала санитайзим окружение для SDK
+            self._prepare_env_for_sdk()
             try:
                 from google import genai
                 from google.genai import types as genai_types
+                try:
+                    from google.genai.errors import ClientError as GenaiClientError  # типовое исключение SDK
+                except Exception:
+                    GenaiClientError = Exception  # запасной вариант
             except Exception as exc:
                 raise RuntimeError(
                     "Photo→video через REST не поддерживается этой моделью. "
@@ -168,14 +206,34 @@ class Veo3Provider(VideoProvider):
             prompt_for_sdk = base_prompt if not strict_ar else _strong_ar_prompt(base_prompt, ar, negative_prompt)
             image_obj = {"image_bytes": image_bytes, "mime_type": image_mime or "image/jpeg"}
 
-            # SDK синхронный — гоняем в отдельном треде
-            operation = await asyncio.to_thread(
-                client.models.generate_videos,
-                model=model_name,
-                prompt=prompt_for_sdk,
-                image=image_obj,
-                config=genai_types.GenerateVideosConfig(**gv_kwargs) if gv_kwargs else None,
-            )
+            async def _sdk_call(curr_model: str):
+                await _respect_submit_gap()
+                return await asyncio.to_thread(
+                    client.models.generate_videos,
+                    model=curr_model,
+                    prompt=prompt_for_sdk,
+                    image=image_obj,
+                    config=genai_types.GenerateVideosConfig(**gv_kwargs) if gv_kwargs else None,
+                )
+
+            tried_downshift = False
+            while True:
+                try:
+                    operation = await _sdk_call(model_name)
+                    break
+                except GenaiClientError as exc:
+                    code = getattr(exc, "status_code", None)
+                    msg = str(exc)
+                    # авто-дауншифт на fast при 429, один раз
+                    if (code == 429 or "RESOURCE_EXHAUSTED" in msg or "Too Many Requests" in msg) and (not fast_flag) and (not tried_downshift):
+                        log.warning("SDK 429; switching model to fast and retrying once")
+                        model_name = "veo-3.0-fast-generate-001"
+                        fast_flag = True
+                        tried_downshift = True
+                        await asyncio.sleep(1.0 + random.uniform(0, 0.5))
+                        continue
+                    raise
+
             op_name = getattr(operation, "name", None) or getattr(operation, "operation", None)
             if not op_name:
                 raise RuntimeError("Veo3 SDK returned no operation name")
@@ -188,14 +246,16 @@ class Veo3Provider(VideoProvider):
             "Content-Type": "application/json",
             "x-goog-api-key": api_key,
         }
-        url_lro = f"{_API_BASE}/models/{model_name}:predictLongRunning"
+
+        def _rest_url(model: str) -> str:
+            return f"{_API_BASE}/models/{model}:predictLongRunning"
+
+        url_lro = _rest_url(model_name)
 
         # Правильная схема для REST: instances[] + parameters{}
         parameters: dict[str, Any] = {
             "aspectRatio": _map_ar(ar),
             "resolution": _map_resolution(desired_resolution, ar),
-            # Ровным счётом это опционально, но явно разрешим генерацию людей в text→video,
-            # чтобы снизить неожиданные блокировки (см. доку по Veo 3).
             "personGeneration": "allow_all",
         }
         if negative_prompt:
@@ -207,21 +267,17 @@ class Veo3Provider(VideoProvider):
 
         prompt_text = _strong_ar_prompt(base_prompt, ar, negative_prompt) if strict_ar else base_prompt
         payload = {
-            "instances": [
-                {
-                    "prompt": prompt_text,
-                }
-            ],
+            "instances": [{"prompt": prompt_text}],
             "parameters": parameters,
         }
 
-        # один-два ретрая на сабмит
+        # один-два ретрая на сабмит + дауншифт на fast при 429
         for attempt in range(3):
             try:
+                await _respect_submit_gap()
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as http:
                     r = await http.post(url_lro, headers=headers, json=payload)
                 if r.status_code >= 400:
-                    # распространённые ошибки схемы полезно подсветить в логе
                     if r.status_code == 400:
                         txt = (r.text or "").strip()
                         if "Unknown name" in txt and ("contents" in txt or "generationConfig" in txt):
@@ -232,17 +288,27 @@ class Veo3Provider(VideoProvider):
                                 "Photo→video через REST не поддерживается (imageBytes). "
                                 "Нужно использовать SDK (google-genai)."
                             )
+                    # авто-дауншифт на fast при 429 (один раз)
+                    if r.status_code == 429 and not fast_flag:
+                        log.warning("REST 429; switching model to fast and retrying once")
+                        model_name = "veo-3.0-fast-generate-001"
+                        url_lro = _rest_url(model_name)
+                        fast_flag = True
+                        await asyncio.sleep(1.0 + random.uniform(0, 0.5))
+                        continue
                     if _is_transient_status(r.status_code) and attempt < 2:
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
                     log.error("Veo3 submit failed %s %s\nBody: %s", r.status_code, r.reason_phrase, r.text)
                     raise RuntimeError("Veo3 submission failed")
+
                 data = r.json()
                 op_name = data.get("name") or data.get("operation")
                 if not op_name:
                     raise RuntimeError("Veo3 submission succeeded but no operation name")
                 log.info("Google Veo operation started: %s", op_name)
                 return op_name
+
             except _TRANSIENT_ERRORS as exc:
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))
