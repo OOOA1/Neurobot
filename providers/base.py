@@ -4,31 +4,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Dict, Literal, Protocol, runtime_checkable
 
 from providers.models import GenerationParams
 
 
 class Provider(str, Enum):
     """Supported video generation providers."""
-
     LUMA = "luma"
     VEO3 = "veo3"
 
 
 JobId = str
+StatusLiteral = Literal["pending", "running", "succeeded", "failed"]
 
 
 @dataclass(slots=True)
 class JobStatus:
     """Represents a provider job state snapshot."""
-
-    status: str
+    status: StatusLiteral
     progress: int = 0
     error: str | None = None
-    extra: dict | None = None
+    extra: Dict[str, Any] | None = None
 
 
+@runtime_checkable
 class VideoProvider(Protocol):
     """Common contract for video generation providers."""
 

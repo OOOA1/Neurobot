@@ -65,3 +65,11 @@ yarn-error.log*
 .env.development.local
 .env.test.local
 .env.production.local
+
+# FFmpeg binaries & folders
+ffmpeg/
+**/ffmpeg/
+**/ffmpeg-*/         # на случай распакованных архивов с версией в имени
+**/ffmpeg*/bin/
+**/ffmpeg*/doc/
+**/ffmpeg*/presets/

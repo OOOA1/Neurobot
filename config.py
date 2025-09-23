@@ -3,24 +3,24 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Iterable, Set
+from pathlib import Path
+from typing import Iterable, Set, Tuple
 
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Загружаем .env до чтения переменных
 load_dotenv()
 
-# Поддержка двух переменных для токена — берём любую доступную (но не «затираем» вторую)
-_BOT_TOKEN = os.getenv("BOT_TOKEN", "") or ""
-_TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "") or ""
-if not _BOT_TOKEN and _TG_BOT_TOKEN:
-    _BOT_TOKEN = _TG_BOT_TOKEN
-if not _TG_BOT_TOKEN and _BOT_TOKEN:
-    _TG_BOT_TOKEN = _BOT_TOKEN
+# ---------- Вспомогательные функции ----------
 
-# Backward-compat: допускаем VEO_API_KEY как синоним GEMINI_API_KEY
-_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") or os.getenv("VEO_API_KEY", "")
+def _coalesce_env(*names: str, default: str = "") -> str:
+    """Берём первое непустое значение из списка имён переменных окружения."""
+    for n in names:
+        v = os.getenv(n, "")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return default
 
 
 def _parse_admin_ids(raw: object) -> Set[int]:
@@ -73,6 +73,32 @@ def _parse_admin_ids(raw: object) -> Set[int]:
     return ids
 
 
+def _resolve_executable(p: str, fallback: str) -> str:
+    """
+    Если задан абсолютный/относительный путь к .exe — норм.
+    Если пусто — вернём fallback (ожидается, что он есть в PATH).
+    """
+    p = (p or "").strip()
+    if not p:
+        return fallback
+    # Раскрываем ~ и переменные окружения
+    p = os.path.expandvars(os.path.expanduser(p))
+    # Нормализуем слэши
+    p = str(Path(p))
+    return p
+
+
+# ---------- Совместимость по токенам ----------
+
+# Токен бота: поддерживаем BOT_TOKEN и TG_BOT_TOKEN
+_BOT_TOKEN = _coalesce_env("BOT_TOKEN", "TG_BOT_TOKEN")
+
+# Gemini / Veo / Google API ключ:
+# Поддерживаем GEMINI_API_KEY, VEO_API_KEY и GOOGLE_API_KEY как синонимы
+_GEMINI_API_KEY = _coalesce_env("GEMINI_API_KEY", "VEO_API_KEY", "GOOGLE_API_KEY")
+
+# ---------- Модель конфигурации ----------
+
 class Settings(BaseModel):
     """Application-level configuration derived from environment variables."""
 
@@ -80,13 +106,16 @@ class Settings(BaseModel):
     APP_ENV: str = os.getenv("APP_ENV", "dev")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
-    # Токены бота
+    # Токены бота (оставляем оба поля для совместимости)
     BOT_TOKEN: str = _BOT_TOKEN
-    TG_BOT_TOKEN: str = _TG_BOT_TOKEN  # оставляем для совместимости
+    TG_BOT_TOKEN: str = _BOT_TOKEN  # дублируем, чтобы старый код не ломался
 
     # Ключи провайдеров
     GEMINI_API_KEY: str = _GEMINI_API_KEY
     LUMA_API_KEY: str = os.getenv("LUMA_API_KEY", "")
+
+    # Настройки моделей/провайдеров
+    VEO_MODEL_NAME: str = os.getenv("VEO_MODEL_NAME", "veo-3.0-fast-generate-001")
 
     # Биллинг/квоты
     FREE_TOKENS_ON_JOIN: int = int(os.getenv("FREE_TOKENS_ON_JOIN", 2))
@@ -107,6 +136,16 @@ class Settings(BaseModel):
     BOT_USERNAME: str = os.getenv("BOT_USERNAME", "")
     PROMO_TTL_HOURS: int = int(os.getenv("PROMO_TTL_HOURS", 3))
 
+    # FFmpeg/FFprobe
+    # Если пути не заданы — используем имена бинарей и рассчитываем на PATH
+    FFMPEG_PATH: str = Field(default_factory=lambda: _resolve_executable(os.getenv("FFMPEG_PATH", ""), "ffmpeg"))
+    FFPROBE_PATH: str = Field(default_factory=lambda: _resolve_executable(os.getenv("FFPROBE_PATH", ""), "ffprobe"))
+
+    # Доп. настройки кодека/логирования для media_tools (опционально)
+    VIDEO_CRF: int = int(os.getenv("VIDEO_CRF", 18))
+    FFMPEG_PRESET: str = os.getenv("FFMPEG_PRESET", "slow")
+    FFMPEG_LOG_CMD: bool = os.getenv("FFMPEG_LOG_CMD", "0").lower() in ("1", "true", "yes")
+
     # ---------- Утилиты ----------
     def admin_ids(self) -> Set[int]:
         """Возвращает множество admin user ids (надёжный парсинг из .env/окружения)."""
@@ -124,5 +163,25 @@ class Settings(BaseModel):
         """Возвращает username бота без префикса @."""
         return self.BOT_USERNAME.lstrip("@") if self.BOT_USERNAME else ""
 
+    def ffmpeg_bins(self) -> Tuple[str, str]:
+        """Удобный доступ к путям до ffmpeg/ffprobe (с учётом .env/PATH)."""
+        return self.FFMPEG_PATH, self.FFPROBE_PATH
+
 
 settings = Settings()
+
+# --------- Экспорт переменных окружения для совместимости ---------
+# Некоторые библиотеки и наши утилиты (services/media_tools.py) читают переменные
+# окружения напрямую. Подставим значения из Settings, если они ещё не заданы.
+
+if not os.getenv("FFMPEG_PATH") and settings.FFMPEG_PATH:
+    os.environ["FFMPEG_PATH"] = settings.FFMPEG_PATH
+
+if not os.getenv("FFPROBE_PATH") and settings.FFPROBE_PATH:
+    os.environ["FFPROBE_PATH"] = settings.FFPROBE_PATH
+
+# SDK Google может ожидать GOOGLE_API_KEY в окружении
+if not os.getenv("GEMINI_API_KEY") and settings.GEMINI_API_KEY:
+    os.environ["GEMINI_API_KEY"] = settings.GEMINI_API_KEY
+if not os.getenv("GOOGLE_API_KEY") and settings.GEMINI_API_KEY:
+    os.environ["GOOGLE_API_KEY"] = settings.GEMINI_API_KEY
