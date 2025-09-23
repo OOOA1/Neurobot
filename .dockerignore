@@ -1,0 +1,11 @@
+.git
+__pycache__/
+*.pyc
+.env
+.env.*
+venv/
+dist/
+build/
+data/
+tests/
+ffmpeg/

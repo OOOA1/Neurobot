@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  neurobot:
+    build: .
+    container_name: neurobot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - .:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "print('ok')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+    # Если позже сделаешь вебхук/FastAPI на 8080 — раскомментируй:
+    # ports:
+    #   - "8080:8080"
