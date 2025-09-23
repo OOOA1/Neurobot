@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Callable, Union, Optional
+from typing import Callable, Union, Optional, Tuple
 
 from providers.base import JobId, JobStatus, Provider, VideoProvider
 from providers.models import GenerationParams
@@ -158,20 +158,92 @@ async def create_video(
     return await create_job(params)
 
 
-async def poll_video(provider: str, job_id: JobId) -> JobStatus:
-    """Poll helper that accepts string provider identifiers."""
-    provider_enum = _to_provider_enum(provider)
-    return await poll_job(provider_enum, job_id)
+# ----------------------------------------------------------------------
+# НОВОЕ: пара "Оригинал + HQ" (для 16:9 и 9:16 одинаково)
+# ----------------------------------------------------------------------
+async def create_video_pair(
+    *,
+    prompt: str,
+    aspect_ratio: str,
+    # базовый проход:
+    resolution: Union[int, str] = "720p",
+    fast: bool = True,
+    # HQ проход:
+    send_hq: bool = True,
+    hq_resolution: Union[int, str] = "1080p",
+    # общее:
+    negative_prompt: Optional[str] = None,
+    reference_file_id: Optional[str] = None,
+    strict_ar: bool = True,
+    image_bytes: Optional[bytes] = None,
+    image_mime: Optional[str] = None,
+    seed: Optional[int] = None,
+    duration_seconds: Optional[int] = None,
+) -> Tuple[JobId, Optional[JobId]]:
+    """
+    Создаёт два задания:
+      1) «Оригинал» (обычно fast/720p),
+      2) «HQ» (медленнее, но лучше — 1080p, и МЫ ОТПРАВЛЯЕМ ЕГО И ДЛЯ 9:16).
+    Возвращает (job_id_original, job_id_hq | None).
+    """
+    # 1) первый проход
+    job_id_first = await create_video(
+        provider="veo3",
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        negative_prompt=negative_prompt,
+        fast=fast,
+        reference_file_id=reference_file_id,
+        image_bytes=image_bytes,
+        image_mime=image_mime,
+        seed=seed,
+        duration_seconds=duration_seconds,
+        strict_ar=strict_ar,
+    )
 
+    if not send_hq:
+        return job_id_first, None
 
-async def download_video(provider: str, job_id: JobId) -> Path:
-    """Download helper that accepts string provider identifiers."""
-    provider_enum = _to_provider_enum(provider)
-    return await download_job(provider_enum, job_id)
+    # 2) HQ-проход — всегда с моделью качества и 1080п (вертикаль тоже поддерживается)
+    if isinstance(hq_resolution, int):
+        hq_res_str = f"{hq_resolution}p"
+    else:
+        hq_res_str = str(hq_resolution).lower()
+        if not hq_res_str.endswith("p"):
+            hq_res_str += "p"
+
+    params_hq = GenerationParams(
+        prompt=prompt.strip(),
+        provider=Provider.VEO3,
+        aspect_ratio=aspect_ratio,          # тот же AR, 9:16 тоже идёт в HQ
+        resolution=hq_res_str,              # 1080p
+        negative_prompt=negative_prompt,
+        fast_mode=False,                    # выключаем fast
+        image_bytes=image_bytes,
+        image_mime=image_mime,
+        seed=seed,
+        duration_seconds=duration_seconds,
+        strict_ar=strict_ar,
+        extras={
+            **({"reference_file_id": reference_file_id} if reference_file_id else {}),
+            "model": "veo3",                # quality-модель (для провайдера Polza)
+        },
+    )
+    try:
+        # если в твоём GenerationParams есть поле model — проставим напрямую
+        setattr(params_hq, "model", "veo3")
+    except Exception:
+        pass
+
+    provider = get_provider(Provider.VEO3)
+    job_id_hq = await provider.create_job(params_hq)
+
+    return job_id_first, job_id_hq
 
 
 # ------------------------------
-# НОВОЕ: нормализация результата
+# НОРМАЛИЗАЦИЯ ВЫХОДА
 # ------------------------------
 def _norm_out_path(src: Path, aspect: str) -> Path:
     stem = src.stem
@@ -184,7 +256,7 @@ async def _normalize_to_aspect(src_path: Path, out_path: Path, aspect: str) -> N
     """
     Единая точка нормализации:
     - 16:9 → cover+crop до 1920x1080 (убираем любые внутренние рамки)
-    - 9:16 → вертикальный 1080x1920 канвас с блюр-подложкой (как на референс-скрине)
+    - 9:16 → вертикальный 1080x1920 канвас с блюр-подложкой
     """
     if aspect == "9:16":
         await asyncio.to_thread(build_vertical_blurpad, str(src_path), str(out_path))
@@ -237,7 +309,7 @@ async def generate_wait_download_normalized(
 ) -> Path:
     """
     Удобный «всё-в-одном» пайплайн под Veo3:
-    создать → дождаться → скачать → нормализовать под 16:9/9:16 (без чёрных полос; для 9:16 — blurpad).
+    создать → дождаться → скачать → нормализовать под 16:9/9:16.
     """
     job_id = await create_video(
         provider="veo3",
@@ -256,6 +328,81 @@ async def generate_wait_download_normalized(
 
     status = await wait_for_completion(Provider.VEO3, job_id, interval_sec=poll_interval, timeout_sec=poll_timeout)
     if status.status != "succeeded":
-        raise RuntimeError(f"Generation failed: {status.error or status.status}")
+        raise RuntimeError(f"Generation failed: {status.error or {status.status}}")
 
     return await download_and_normalize_video("veo3", job_id, aspect_ratio)
+
+
+# --------- НОВОЕ: “Оригинал + HQ” полноциклово ----------
+async def generate_wait_download_normalized_pair(
+    *,
+    prompt: str,
+    aspect_ratio: str,
+    # базовый проход:
+    resolution: Union[int, str] = "720p",
+    fast: bool = True,
+    # HQ проход:
+    send_hq: bool = True,
+    hq_resolution: Union[int, str] = "1080p",
+    # общее:
+    negative_prompt: Optional[str] = None,
+    reference_file_id: Optional[str] = None,
+    image_bytes: Optional[bytes] = None,
+    image_mime: Optional[str] = None,
+    seed: Optional[int] = None,
+    duration_seconds: Optional[int] = None,
+    poll_interval: float = 8.0,
+    poll_timeout: float = 20 * 60.0,
+) -> Tuple[Path, Optional[Path]]:
+    """
+    Полный цикл для пары «Оригинал + HQ»:
+    - одинаково работает для 16:9 и 9:16,
+    - HQ-прогон всегда идёт в 1080p (если send_hq=True).
+    Возвращает (path_original, path_hq | None).
+    """
+    job_id_first, job_id_hq = await create_video_pair(
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        fast=fast,
+        send_hq=send_hq,
+        hq_resolution=hq_resolution,
+        negative_prompt=negative_prompt,
+        reference_file_id=reference_file_id,
+        image_bytes=image_bytes,
+        image_mime=image_mime,
+        seed=seed,
+        duration_seconds=duration_seconds,
+        strict_ar=True,
+    )
+
+    # ждём первый
+    st1 = await wait_for_completion(Provider.VEO3, job_id_first, interval_sec=poll_interval, timeout_sec=poll_timeout)
+    if st1.status != "succeeded":
+        raise RuntimeError(f"Original generation failed: {st1.error or st1.status}")
+    path1 = await download_and_normalize_video("veo3", job_id_first, aspect_ratio)
+
+    path2: Optional[Path] = None
+    if job_id_hq:
+        st2 = await wait_for_completion(Provider.VEO3, job_id_hq, interval_sec=poll_interval, timeout_sec=poll_timeout)
+        if st2.status != "succeeded":
+            log.error("HQ generation failed: %s", st2.error or st2.status)
+            path2 = None
+        else:
+            path2 = await download_and_normalize_video("veo3", job_id_hq, aspect_ratio)
+
+    return path1, path2
+
+
+# ------------------------------
+# BACKWARD-COMPAT WRAPPERS
+# ------------------------------
+async def poll_video(provider: str, job_id: JobId) -> JobStatus:
+    """String-friendly wrapper, keeps backward compatibility."""
+    provider_enum = _to_provider_enum(provider)
+    return await poll_job(provider_enum, job_id)
+
+async def download_video(provider: str, job_id: JobId) -> Path:
+    """String-friendly wrapper, keeps backward compatibility."""
+    provider_enum = _to_provider_enum(provider)
+    return await download_job(provider_enum, job_id)

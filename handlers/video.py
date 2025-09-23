@@ -432,7 +432,11 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             await cb.answer("Выберите соотношение сторон (16:9 / 9:16)", show_alert=True)
             return
 
-        resolution_first = 1080
+        # Если промпт пустой, но есть фото — подставим безопасный дефолт,
+        # чтобы Polza не вернула 400 и точно сделала photo->video.
+        used_prompt = prompt or "Animate this image realistically with native audio; keep the subject and style consistent."
+
+        resolution_first = 1080  # 1080p
         reference_file_id = data.get("reference_file_id")
         reference_url = data.get("reference_url")
         mode = (data.get("mode") or "quality").lower()
@@ -477,7 +481,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             strict = True
             job_id_first = await generation_service.create_video(
                 provider="veo3",
-                prompt=prompt,
+                prompt=used_prompt,
                 aspect_ratio=aspect,
                 resolution=resolution_first,
                 negative_prompt=negative_prompt,
@@ -493,11 +497,18 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                     await _prepare(db)
                     await refund_user_tokens(db, cb.from_user.id, expected_cost)
             log.exception("Veo3 submit failed: %s", exc)
-            txt = str(exc).lower()
-            if "resource_exhausted" in txt or "quota" in txt or "rate limit" in txt:
+            txt = str(exc)
+            low = txt.lower()
+            # Новая дружелюбная ветка для Polza
+            if "INSUFFICIENT_BALANCE" in txt or "payment required" in low or "402" in low:
                 await status_message.edit_text(
-                    "❗ Не удалось начать генерацию: превышен лимит/квота Gemini API.\n"
-                    "Попробуйте позже, включите оплату в Google AI Studio, либо переключите режим на Fast."
+                    "❗ Не удалось начать генерацию: недостаточно средств в Polza.ai.\n"
+                    "Пополните баланс/повысьте лимит ключа и попробуйте снова."
+                )
+            elif "resource_exhausted" in low or "quota" in low or "rate limit" in low:
+                await status_message.edit_text(
+                    "❗ Не удалось начать генерацию: превышен лимит/квота провайдера.\n"
+                    "Попробуйте позже или переключите режим на Fast."
                 )
             else:
                 await status_message.edit_text("Не удалось начать генерацию")
@@ -564,23 +575,27 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 with suppress(OSError):
                     os.remove(to_send_first_fixed)
 
+        # Если пользователь выбрал Quality — запускаем HQ-проход (и для 9:16 тоже!)
         if mode != "quality":
             await status_message.edit_text("Видео отправлено")
             return
 
         try:
-            job_id_hq = await generation_service.create_video(
-                provider="veo3",
-                prompt=prompt,
-                aspect_ratio=aspect,
-                resolution=1080,
+            # Второй проход: форсируем качественную модель 'veo3' и 1080p
+            params_hq = GenerationParams(
+                prompt=used_prompt,
+                provider=Provider.VEO3,
+                aspect_ratio=aspect,          # 9:16 поддерживаем так же, как 16:9
+                resolution="1080p",
                 negative_prompt=negative_prompt,
-                fast=(mode == "fast"),
-                reference_file_id=(reference_url or reference_file_id) or None,
-                strict_ar=True,
+                fast_mode=False,
                 image_bytes=data.get("image_bytes"),
                 image_mime=data.get("image_mime"),
+                strict_ar=True,
+                extras={**({"reference_file_id": (reference_url or reference_file_id)} if (reference_url or reference_file_id) else {})},
+                model="veo3",                # качественная модель
             )
+            job_id_hq = await generation_service.create_job(params_hq)
         except Exception as exc:
             log.exception("Veo3 submit (HQ) failed: %s", exc)
             await status_message.edit_text("Видео отправлено (HQ-версию начать не удалось)")
