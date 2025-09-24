@@ -41,6 +41,7 @@ class GenerationParams:
     # Изображение для photo->video
     image_bytes: Optional[bytes] = None          # «сырые» байты изображения
     image_mime: Optional[str] = None             # "image/jpeg" | "image/png"
+    image_url: Optional[str] = None              # Прямая HTTP/HTTPS ссылка на референс (для Polza/KIE)
 
     # Строгое соблюдение AR (по умолчанию включено)
     strict_ar: bool = True
@@ -69,6 +70,11 @@ class GenerationParams:
         if isinstance(self.negative_prompt, str):
             np = self.negative_prompt.strip()
             self.negative_prompt = np or None
+
+        # image_url — уберём пустые строки/пробелы
+        if isinstance(self.image_url, str):
+            url = self.image_url.strip()
+            self.image_url = url or None
 
         # extras — гарантированно dict
         if not isinstance(self.extras, dict):

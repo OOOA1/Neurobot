@@ -143,7 +143,7 @@ def _build_polza_input(p: GenerationParams) -> dict:
         getattr(p, "image", None),
         extras.get("reference_url"),
         # ВНИМАНИЕ: reference_file_id может быть просто file_id TG, он не HTTP — не отправляем его как URL.
-        extras.get("reference_file_id"),
+        # extras.get("reference_file_id"),
     )
     if not _is_http_url(image_url):
         image_url = None
@@ -201,6 +201,8 @@ def _build_polza_input(p: GenerationParams) -> dict:
         payload_input["image"]       = image_url
         payload_input["image_url"]   = image_url
         payload_input["reference"]   = image_url
+        # КРИТИЧЕСКОЕ поле для image->video в KIE/veo3
+        payload_input["imageUrls"]   = [image_url]
     elif image_bytes and image_mime:
         # при необходимости можно добавить поддержку base64:
         # payload_input["image_base64"] = base64.b64encode(image_bytes).decode()
@@ -229,6 +231,9 @@ def _flatten_for_polza_top_level(inp: dict) -> dict:
         top["image"] = img
         top["image_url"] = img
         top["reference"] = img
+        # Дублируем и здесь, чтобы вся цепочка явно видела imageUrls
+        if inp.get("imageUrls"):
+            top["imageUrls"] = list(inp["imageUrls"])
     return {k: v for k, v in top.items() if v not in (None, "", [])}
 
 def _extract_video_url(data: dict[str, Any]) -> Optional[str]:
