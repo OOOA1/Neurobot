@@ -3,7 +3,25 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-def main_menu_kb(balance: float | None = None) -> InlineKeyboardMarkup:
+def _format_balance(balance: float | int | None) -> str:
+    """
+    Форматируем баланс так, чтобы:
+      - 0 показывался как '0.0'
+      - None / NaN / отрицательные значения -> '0.0'
+    Никаких подстановок из настроек, только фактическое значение.
+    """
+    try:
+        val = 0.0 if balance is None else float(balance)
+        if val != val:  # NaN
+            val = 0.0
+        if val < 0:
+            val = 0.0
+        return f"{val:.1f}"
+    except Exception:
+        return "0.0"
+
+
+def main_menu_kb(balance: float | int | None = None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     # Блок работы с видео
@@ -11,8 +29,8 @@ def main_menu_kb(balance: float | None = None) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🧩 Работа с видео", callback_data="menu:video"),
     )
 
-    # Баланс (с отображением числа токенов, если передан balance)
-    balance_label = f"💳 Баланс: {balance:.1f}" if balance is not None else "💳 Баланс"
+    # Баланс — всегда показываем число, даже если balance=None
+    balance_label = f"💳 Баланс: {_format_balance(balance)}"
     builder.row(
         InlineKeyboardButton(text=balance_label, callback_data="menu:balance"),
     )
@@ -38,7 +56,7 @@ def main_menu_kb(balance: float | None = None) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def back_to_main_menu_kb(balance: float | None = None) -> InlineKeyboardMarkup:
+def back_to_main_menu_kb(balance: float | int | None = None) -> InlineKeyboardMarkup:
     """
     Кнопка возврата в главное меню. Можно сразу отрисовать главное меню с балансом.
     """
