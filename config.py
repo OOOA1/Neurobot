@@ -117,8 +117,22 @@ class Settings(BaseModel):
     # Настройки моделей/провайдеров
     VEO_MODEL_NAME: str = os.getenv("VEO_MODEL_NAME", "veo-3.0-fast-generate-001")
 
-    # Биллинг/квоты
-    FREE_TOKENS_ON_JOIN: int = int(os.getenv("FREE_TOKENS_ON_JOIN", 2))
+    # Биллинг/квоты (переведено в float для поддержки дробных стоимостей)
+    FREE_TOKENS_ON_JOIN: float = float(os.getenv("FREE_TOKENS_ON_JOIN", 2))
+
+    # Стоимости токенов по провайдерам/режимам
+    # (значения по умолчанию подобраны безопасно; переопредели в .env при необходимости)
+    VEO_COST_FAST_TOKENS: float = float(os.getenv("VEO_COST_FAST_TOKENS", 2.0))
+    VEO_COST_QUALITY_TOKENS: float = float(os.getenv("VEO_COST_QUALITY_TOKENS", 10.0))
+
+    LUMA_COST_FAST_TOKENS: float = float(os.getenv("LUMA_COST_FAST_TOKENS", 2.0))
+    LUMA_COST_QUALITY_TOKENS: float = float(os.getenv("LUMA_COST_QUALITY_TOKENS", 10.0))
+
+    # Политика админов: списывать ли токены у администраторов
+    # ADMIN_TOKENS_BYPASS=1 -> не списывать токены у админов
+    ADMIN_TOKENS_BYPASS: bool = os.getenv("ADMIN_TOKENS_BYPASS", "0").lower() in ("1", "true", "yes")
+
+    # Пределы задач
     MAX_ACTIVE_JOBS_PER_USER: int = int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", 1))
     DAILY_JOB_LIMIT: int = int(os.getenv("DAILY_JOB_LIMIT", 20))
 
@@ -146,13 +160,16 @@ class Settings(BaseModel):
     FFMPEG_PRESET: str = os.getenv("FFMPEG_PRESET", "slow")
     FFMPEG_LOG_CMD: bool = os.getenv("FFMPEG_LOG_CMD", "0").lower() in ("1", "true", "yes")
 
+    # Точность сравнений баланса (для анти-флота при списаниях)
+    TOKENS_EPSILON: float = float(os.getenv("TOKENS_EPSILON", 1e-9))
+
     # ---------- Утилиты ----------
     def admin_ids(self) -> Set[int]:
         """Возвращает множество admin user ids (надёжный парсинг из .env/окружения)."""
         return _parse_admin_ids(self.ADMIN_USER_IDS)
 
     def is_admin(self, user_id: int | str) -> bool:
-        """Проверка, что пользователь — админ (удобно вызывать из хендлеров)."""
+        """Проверка, что пользователь — админ (удобно вызывать из хендлеров/провайдеров)."""
         try:
             uid = int(user_id)
         except Exception:
@@ -166,6 +183,33 @@ class Settings(BaseModel):
     def ffmpeg_bins(self) -> Tuple[str, str]:
         """Удобный доступ к путям до ffmpeg/ffprobe (с учётом .env/PATH)."""
         return self.FFMPEG_PATH, self.FFPROBE_PATH
+
+    # ------- Логика токенов (чтение политики/стоимостей) --------
+    def initial_tokens(self) -> float:
+        """Сколько токенов выдавать при первом входе пользователя (/start)."""
+        return float(self.FREE_TOKENS_ON_JOIN)
+
+    def should_charge_tokens(self, user_id: int | str) -> bool:
+        """
+        Нужно ли списывать токены у данного пользователя.
+        Если ADMIN_TOKENS_BYPASS=1 и пользователь админ — не списываем.
+        """
+        return not (self.ADMIN_TOKENS_BYPASS and self.is_admin(user_id))
+
+    def token_cost(self, provider: str, quality: str = "fast") -> float:
+        """
+        Стоимость одной генерации в токенах по провайдеру/качеству.
+        provider: 'veo' | 'luma' (без регистра)
+        quality: 'fast' | 'quality' (без регистра)
+        """
+        p = (provider or "").strip().lower()
+        q = (quality or "").strip().lower()
+        if p == "veo":
+            return self.VEO_COST_FAST_TOKENS if q == "fast" else self.VEO_COST_QUALITY_TOKENS
+        if p == "luma":
+            return self.LUMA_COST_FAST_TOKENS if q == "fast" else self.LUMA_COST_QUALITY_TOKENS
+        # дефолт — как у fast
+        return self.VEO_COST_FAST_TOKENS if q == "fast" else self.VEO_COST_QUALITY_TOKENS
 
 
 settings = Settings()

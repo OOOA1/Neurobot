@@ -47,7 +47,15 @@ log = logging.getLogger(__name__)
 
 # -------- admin helpers --------
 def _is_admin(user_id: int) -> bool:
-    return settings.is_admin(user_id)
+    """
+    Та же надёжная проверка, что и в handlers/balance.py:
+    сначала пробуем settings.admin_ids(), иначе — парсим ADMIN_USER_IDS как строку.
+    """
+    try:
+        return user_id in settings.admin_ids()
+    except Exception:
+        raw = (getattr(settings, "ADMIN_USER_IDS", "") or "").replace(" ", "")
+        return str(user_id) in {x for x in raw.split(",") if x}
 
 # -------- Veo states --------
 class VeoWizardStates(StatesGroup):
@@ -195,7 +203,6 @@ async def _edit_summary(
                         chat_id=meta["chat_id"], message_id=meta["message_id"], reply_markup=markup
                     )
                 return
-            # если редактирование не удалось — попробуем отправить новое сообщение ниже
         except Exception:
             pass
 
@@ -413,7 +420,6 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "ref" and value == "clear":
-        # Кнопки очистки сейчас нет в UI, но обработчик оставим на всякий случай.
         data = await _update_data(
             state, reference_file_id=None, reference_url=None, image_bytes=None, image_mime=None
         )
@@ -432,8 +438,6 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             await cb.answer("Выберите соотношение сторон (16:9 / 9:16)", show_alert=True)
             return
 
-        # Если промпт пустой, но есть фото — подставим безопасный дефолт,
-        # чтобы провайдер гарантированно пошёл в image→video.
         used_prompt = prompt or "Animate this image realistically; keep the subject and style consistent."
 
         resolution_first = 1080  # 1080p
@@ -441,26 +445,28 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         reference_url = data.get("reference_url")
         mode = (data.get("mode") or "quality").lower()
         negative_prompt = (data.get("negative_text") or None) if data.get("negative_enabled") else None
-        is_admin = _is_admin(cb.from_user.id)
+
+        # ---- ЛОГИКА ТОКЕНОВ (Veo): только should_charge_tokens + БД ----
+        user_id = cb.from_user.id
+        should_charge = settings.should_charge_tokens(user_id)
+        eps = getattr(settings, "TOKENS_EPSILON", 1e-9)
+        expected_cost = _current_cost(data)
 
         async with connect() as db:
             await _prepare(db)
-            await ensure_user(db, cb.from_user.id, cb.from_user.username, settings.FREE_TOKENS_ON_JOIN)
+            await ensure_user(db, user_id, cb.from_user.username, settings.FREE_TOKENS_ON_JOIN)
 
-        expected_cost = _current_cost(data)
-
-        if not is_admin:
+        if should_charge:
             async with connect() as db:
                 await _prepare(db)
-                bal = await get_user_balance(db, cb.from_user.id)
-            if bal < expected_cost:
+                bal = await get_user_balance(db, user_id)
+            if bal + eps < expected_cost:
                 await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
                 await cb.answer(); return
 
-        if not is_admin:
             async with connect() as db:
                 await _prepare(db)
-                charged = await charge_user_tokens(db, cb.from_user.id, expected_cost)
+                charged = await charge_user_tokens(db, user_id, expected_cost)
             if not charged:
                 await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder())
                 await cb.answer(); return
@@ -485,21 +491,20 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 resolution=resolution_first,
                 negative_prompt=negative_prompt,
                 fast=(mode == "fast"),
-                reference_file_id=reference_file_id,  # ← отдельно
-                reference_url=reference_url,          # ← отдельно
+                reference_file_id=reference_file_id,
+                reference_url=reference_url,
                 strict_ar=strict,
                 image_bytes=image_bytes,
                 image_mime=image_mime,
             )
         except Exception as exc:
-            if not is_admin:
+            if should_charge:
                 async with connect() as db:
                     await _prepare(db)
-                    await refund_user_tokens(db, cb.from_user.id, expected_cost)
+                    await refund_user_tokens(db, user_id, expected_cost)
             log.exception("Veo3 submit failed: %s", exc)
             txt = str(exc)
             low = txt.lower()
-            # Новая дружелюбная ветка для Polza
             if "INSUFFICIENT_BALANCE" in txt or "payment required" in low or "402" in low:
                 await status_message.edit_text(
                     "❗ Не удалось начать генерацию: недостаточно средств в Polza.ai.\n"
@@ -521,10 +526,10 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             timeout_sec=max(60.0, settings.JOB_MAX_WAIT_MIN * 60), interval_schedule=interval_plan
         )
         if first_status.status != "succeeded":
-            if not is_admin:
+            if should_charge:
                 async with connect() as db:
                     await _prepare(db)
-                    await refund_user_tokens(db, cb.from_user.id, expected_cost)
+                    await refund_user_tokens(db, user_id, expected_cost)
             await status_message.edit_text(first_status.error or "Генерация завершилась с ошибкой")
             return
 
@@ -538,24 +543,24 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             video_path_first = await generation_service.download_video("veo3", job_id_first)
         except Exception as exc:
             log.exception("Veo3 download (first) failed: %s", exc)
-            if not is_admin:
+            if should_charge:
                 async with connect() as db:
                     await _prepare(db)
-                    await refund_user_tokens(db, cb.from_user.id, expected_cost)
+                    await refund_user_tokens(db, user_id, expected_cost)
             await status_message.edit_text("Не удалось скачать видео")
             return
 
         to_send_first = video_path_first
         to_send_first_fixed = await _normalize_result(Path(to_send_first), aspect)
 
-        caption_first = "Ваше видео сгенерировано. Спасибо что пользуетесь нашим ботом"
-        if not is_admin:
+        caption_first = "Ваше видео сгенерировано."
+        if should_charge:
             async with connect() as db:
                 await _prepare(db)
-                left_balance = await get_user_balance(db, cb.from_user.id)
+                left_balance = await get_user_balance(db, user_id)
             caption_first = (
-                f"Ваше видео сгенерировано. Остаток баланса - {left_balance} токенов. "
-                f"Спасибо что пользуетесь нашим ботом"
+                f"Ваше видео сгенерировано. Остаток баланса — {left_balance} токенов. "
+                f"Спасибо, что пользуетесь нашим ботом."
             )
 
         try:
@@ -575,13 +580,11 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 with suppress(OSError):
                     os.remove(to_send_first_fixed)
 
-        # Если пользователь выбрал Quality — запускаем HQ-проход (и для 9:16 тоже!)
         if mode != "quality":
             await status_message.edit_text("Видео отправлено")
             return
 
         try:
-            # Второй проход: форсируем качественную модель 'veo3' и 1080p
             extras_hq: dict[str, Any] = {}
             if reference_file_id:
                 extras_hq["reference_file_id"] = reference_file_id
@@ -591,7 +594,7 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             params_hq = GenerationParams(
                 prompt=used_prompt,
                 provider=Provider.VEO3,
-                aspect_ratio=aspect,          # 9:16 поддерживаем так же, как 16:9
+                aspect_ratio=aspect,
                 resolution="1080p",
                 negative_prompt=negative_prompt,
                 fast_mode=False,
@@ -599,9 +602,8 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 image_mime=data.get("image_mime"),
                 strict_ar=True,
                 extras=extras_hq,
-                model="veo3",                 # качественная модель
+                model="veo3",
             )
-            # Мягко проставим image_url, если это поле у модели есть
             if reference_url and getattr(params_hq, "image_url", None) in (None, ""):
                 try:
                     setattr(params_hq, "image_url", reference_url)
@@ -771,11 +773,13 @@ def _render_luma_summary(state: dict[str, Any]) -> str:
     prompt = state.get("prompt") or "—"
     video = "да" if state.get("video_file_id") else "нет"
     intensity = int(state.get("intensity") or 1)
+    cost_tokens = float(settings.token_cost("luma", "fast"))
     lines = [
         "✂️ Luma",
         f"📝 Промпт: {prompt}",
         f"🎬 Видео: {video}",
         f"🎚️ Интенсивность: x{intensity}",
+        f"\n💰 Стоимость: {cost_tokens:.1f} токена(ов)",
         "📎 Можно сгенерировать видео по промпту или отредактировать своё видео (загрузите файл и добавьте промпт).",
     ]
     return "\n".join(lines)
@@ -868,7 +872,14 @@ async def luma_callback(cb: CallbackQuery, state: FSMContext) -> None:
         if not video_file_id and not prompt:
             await cb.answer("Добавьте промпт (генерация по тексту)", show_alert=True); return
         await cb.answer("Запуск…")
-        await _run_luma_generation(message, data); return
+        # ключевая правка: передаём ID и username инициатора клика (как у Veo)
+        await _run_luma_generation(
+            message,
+            data,
+            actor_id=cb.from_user.id,
+            actor_username=cb.from_user.username,
+        )
+        return
 
     if action == "reset":
         data = LUMA_DEFAULT_STATE.copy()
@@ -920,41 +931,62 @@ async def luma_video_input(msg: Message, state: FSMContext) -> None:
     await _luma_update_view(message=None, bot=msg.bot, state=state, data=data)
     await msg.answer("Видео сохранено")
 
-async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
+# ключевая правка — сигнатура с actor_id / actor_username
+async def _run_luma_generation(
+    message: Message,
+    data: dict[str, Any],
+    *,
+    actor_id: int | None = None,
+    actor_username: str | None = None,
+) -> None:
     prompt = (data.get("prompt") or "").strip()
     video_file_id = data.get("video_file_id")
     intensity = int(data.get("intensity") or 1)
     mode = "edit" if video_file_id else "generate"
-    is_admin = _is_admin(message.from_user.id)
 
+    # берём реальный ID инициатора (как у Veo), а не message.from_user (это бот)
+    user_id = actor_id or (getattr(message, "chat", None).id if getattr(message, "chat", None) else None) or message.from_user.id
+    username_for_ensure = actor_username if actor_username is not None else getattr(message.chat, "username", None)
+
+    # ---- ЛОГИКА ТОКЕНОВ (точно как у Veo) ----
+    should_charge = settings.should_charge_tokens(user_id)
+    eps = getattr(settings, "TOKENS_EPSILON", 1e-9)
+    # В UI Luma нет выбора fast/quality — берём "fast" тариф из настроек:
+    expected_cost = settings.token_cost("luma", "fast")
+
+    # 2) Гарантируем, что юзер есть в БД (как в Veo)
     async with connect() as db:
         await _prepare(db)
-        await ensure_user(db, message.from_user.id, message.from_user.username, settings.FREE_TOKENS_ON_JOIN)
+        await ensure_user(db, user_id, username_for_ensure, settings.FREE_TOKENS_ON_JOIN)
 
-    if not is_admin:
+    # 3) Если списывать нужно — проверяем баланс и списываем (ровно как Veo)
+    if should_charge:
         async with connect() as db:
             await _prepare(db)
-            bal = await get_user_balance(db, message.from_user.id)
-        if bal < GENERATION_COST_TOKENS:
+            bal = await get_user_balance(db, user_id)
+        if bal + eps < expected_cost:
             await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder()); return
 
-    if not is_admin:
         async with connect() as db:
             await _prepare(db)
-            charged = await charge_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+            charged = await charge_user_tokens(db, user_id, expected_cost)
         if not charged:
             await message.answer(INSUFFICIENT_TOKENS, reply_markup=balance_kb_placeholder()); return
 
+    # 4) Запускаем и маркируем extras «precharged», если реально списали (как в Veo-духе)
     status_message = await message.answer("Генерация началась…")
     extras: dict[str, Any] = {"intensity": int(max(1, min(3, intensity)))}
     if mode == "edit" and video_file_id:
         extras["video_file_id"] = video_file_id
+    extras["user_id"] = user_id
+    # провайдеру сигнализируем о том, что списание уже произведено здесь
+    extras["precharged"] = bool(should_charge)
 
     params = GenerationParams(prompt=prompt, provider=Provider.LUMA, model=None, extras=extras)
 
     async with connect() as db:
         await _prepare(db)
-        user = await ensure_user(db, message.from_user.id, message.from_user.username, 0)
+        user = await ensure_user(db, user_id, username_for_ensure, 0)
         job_id = await create_job(
             db,
             user_id=user["id"],
@@ -972,8 +1004,8 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
         async with connect() as db:
             await _prepare(db)
             await set_job_status(db, job_id, "failed")
-            if not is_admin:
-                await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+            if should_charge:
+                await refund_user_tokens(db, user_id, expected_cost)
         return
 
     async with connect() as db:
@@ -982,7 +1014,13 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
         await set_job_status(db, job_id, "running")
 
     poll_interval = max(3.0, settings.JOB_POLL_INTERVAL_SEC)
+
+    # ==== НОВОЕ: трекинг стадий + таймаут ожидания ====
+    started_at = asyncio.get_event_loop().time()
+    max_wait = max(60.0, settings.JOB_MAX_WAIT_MIN * 60)
+    last_state = None
     failure_text: str | None = None
+
     while True:
         try:
             status = await generation_service.poll_job(Provider.LUMA, provider_job_id)
@@ -991,11 +1029,17 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
             failure_text = "Ошибка при получении статуса Luma"
             break
 
+        # стадия от провайдера (queued/starting/dreaming/...)
+        state = (status.extra or {}).get("state") if status.extra else None
+        if state != last_state:
+            log.info("Luma %s state -> %s", provider_job_id, state)
+            last_state = state
+
         if status.status == "failed":
-            if not is_admin:
+            if should_charge:
                 async with connect() as db:
                     await _prepare(db)
-                    await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+                    await refund_user_tokens(db, user_id, expected_cost)
             failure_text = status.error or "Luma не смогла завершить задачу"
             break
 
@@ -1009,10 +1053,10 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
                 video_path = await generation_service.download_job(Provider.LUMA, provider_job_id)
             except Exception as exc:
                 log.exception("Luma download failed: %s", exc)
-                if not is_admin:
+                if should_charge:
                     async with connect() as db:
                         await _prepare(db)
-                        await refund_user_tokens(db, message.from_user.id, GENERATION_COST_TOKENS)
+                        await refund_user_tokens(db, user_id, expected_cost)
                 failure_text = "Не удалось скачать видео"
                 break
             try:
@@ -1023,13 +1067,35 @@ async def _run_luma_generation(message: Message, data: dict[str, Any]) -> None:
             await status_message.edit_text("Видео отправлено")
             return
 
-        progress = status.progress or 0
+        # отображаем понятный статус вместо «0%»
+        human = {
+            "queued": "в очереди",
+            "starting": "запуск",
+            "dreaming": "генерация",
+            "processing": "обработка",
+            "running": "в работе",
+        }.get((state or "").lower(), state or "ожидание")
+
         try:
-            await status_message.edit_text(f"Генерация идёт…\nГотовность: {progress}%")
+            await status_message.edit_text(f"Генерация идёт…\nСтатус: {human}")
         except TelegramBadRequest as exc:
             if not _not_modified(exc):
                 raise
+
+        # таймаут ожидания
+        if asyncio.get_event_loop().time() - started_at > max_wait:
+            if should_charge:
+                async with connect() as db:
+                    await _prepare(db)
+                    await refund_user_tokens(db, user_id, expected_cost)
+            failure_text = "Luma слишком долго в очереди. Попробуйте позже."
+            break
+
         await asyncio.sleep(poll_interval)
 
     if failure_text:
         await status_message.edit_text(failure_text)
+        # помечаем задачу как неуспешную
+        async with connect() as db:
+            await _prepare(db)
+            await set_job_status(db, job_id, "failed")

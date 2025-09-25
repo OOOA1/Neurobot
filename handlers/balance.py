@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
+
 from aiogram import F, Router
-from aiogram.types import Message, CallbackQuery
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
 
 from config import settings
-from db import connect, _prepare, ensure_user, get_user_balance, add_user_tokens
+from db import add_user_tokens, connect, ensure_user, get_user_balance, _prepare
 from keyboards.balance_kb import balance_kb
 from keyboards.main_menu_kb import main_menu_kb
 from texts import BALANCE_VIEW, WELCOME
@@ -33,6 +36,22 @@ def _is_admin(user_id: int) -> bool:
         return str(user_id) in {x for x in raw.split(",") if x}
 
 
+async def _safe_cb_answer(cb: CallbackQuery, *args, **kwargs):
+    # Безопасно закрываем "часики" и игнорируем просроченные коллбэки/дубли
+    with suppress(TelegramBadRequest):
+        return await cb.answer(*args, **kwargs)
+
+
+async def _safe_edit_text(message: Message, *args, **kwargs):
+    try:
+        return await message.edit_text(*args, **kwargs)
+    except TelegramBadRequest as e:
+        # Не падаем, если текст/markup не меняются
+        if "message is not modified" in str(e).lower():
+            return message
+        raise
+
+
 async def _send_balance_view(message_or_cb, tg_user_id: int, username: str | None):
     async with connect() as db:
         await _prepare(db)
@@ -46,7 +65,9 @@ async def _send_balance_view(message_or_cb, tg_user_id: int, username: str | Non
     if isinstance(message_or_cb, Message):
         await message_or_cb.answer(text, reply_markup=kb)
     else:
-        await message_or_cb.message.edit_text(text, reply_markup=kb)
+        # Для callback — редактируем безопасно (не падаем на "message is not modified")
+        if message_or_cb.message:
+            await _safe_edit_text(message_or_cb.message, text, reply_markup=kb)
 
 
 @router.message(F.text.casefold() == "баланс")
@@ -56,7 +77,7 @@ async def balance_entry(msg: Message, state: FSMContext):
 
 @router.callback_query(F.data == "menu:balance")
 async def balance_from_menu(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
+    await _safe_cb_answer(cb)  # сразу закрываем "часики"
     if not cb.message:
         return
     await _send_balance_view(cb, cb.from_user.id, cb.from_user.username)
@@ -64,18 +85,22 @@ async def balance_from_menu(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "balance:back")
 async def balance_back(cb: CallbackQuery, state: FSMContext):
+    # Сначала закрываем "часики", чтобы не словить "query is too old"
+    await _safe_cb_answer(cb)
+
     # Возврат в главное меню с актуальным балансом в кнопке
     async with connect() as db:
         await _prepare(db)
         balance = await get_user_balance(db, cb.from_user.id)
-    await cb.message.edit_text(WELCOME, reply_markup=main_menu_kb(balance))
-    await cb.answer()
+
+    if cb.message:
+        await _safe_edit_text(cb.message, WELCOME, reply_markup=main_menu_kb(balance))
 
 
 @router.callback_query(F.data.startswith("buy:"))
 async def balance_buy(cb: CallbackQuery):
-    plan = cb.data.split(":", 1)[1]
-    await cb.answer()  # закрываем «часики» без алёртов
+    plan = cb.data.split(":", 1)[1] if cb.data else ""
+    await _safe_cb_answer(cb)  # закрываем «часики» без алёртов
 
     if not cb.message:
         return
