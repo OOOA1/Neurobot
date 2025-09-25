@@ -114,6 +114,7 @@ async def create_video(
     negative_prompt: Optional[str] = None,
     fast: bool = False,
     reference_file_id: Optional[str] = None,
+    reference_url: Optional[str] = None,   # ← важно для image→video по URL
     strict_ar: bool = True,
     # Новые параметры для photo->video:
     image_bytes: Optional[bytes] = None,
@@ -125,9 +126,11 @@ async def create_video(
     """
     Convenience helper used by the Veo3 wizard.
 
-    Теперь умеет принимать сырые байты изображения (image_bytes) и их mime (image_mime).
-    Если также указан reference_file_id (URL/Gemini files/локальный путь), провайдер решит,
-    чем именно воспользоваться: приоритет обычно за image_bytes/image_mime.
+    Теперь умеет принимать:
+      - сырые байты изображения (image_bytes) + их mime (image_mime);
+      - reference_file_id (tg file_id/url/локальный путь);
+      - reference_url (прямая HTTP-ссылка) — критично для Polza/KIE (image→video).
+    Если указаны и image_bytes, и reference_url — провайдер сам решит приоритет.
     """
     provider_enum = _to_provider_enum(provider)
     if provider_enum is not Provider.VEO3:
@@ -141,6 +144,12 @@ async def create_video(
         if not resolution_str.endswith("p"):
             resolution_str += "p"
 
+    extras: dict = {}
+    if reference_file_id:
+        extras["reference_file_id"] = reference_file_id
+    if reference_url:
+        extras["reference_url"] = reference_url  # донесём до провайдера
+
     params = GenerationParams(
         prompt=prompt.strip(),
         provider=provider_enum,
@@ -153,13 +162,21 @@ async def create_video(
         seed=seed,
         duration_seconds=duration_seconds,
         strict_ar=strict_ar,
-        extras={**({"reference_file_id": reference_file_id} if reference_file_id else {})},
+        extras=extras,
     )
+
+    # Если у модели параметров есть поле image_url — проставим его для совместимости.
+    if reference_url and getattr(params, "image_url", None) in (None, ""):
+        try:
+            setattr(params, "image_url", reference_url)
+        except Exception:
+            pass
+
     return await create_job(params)
 
 
 # ----------------------------------------------------------------------
-# НОВОЕ: пара "Оригинал + HQ" (для 16:9 и 9:16 одинаково)
+# ПАРА «Оригинал + HQ» (для 16:9 и 9:16 одинаково)
 # ----------------------------------------------------------------------
 async def create_video_pair(
     *,
@@ -174,6 +191,7 @@ async def create_video_pair(
     # общее:
     negative_prompt: Optional[str] = None,
     reference_file_id: Optional[str] = None,
+    reference_url: Optional[str] = None,     # ← добавлено
     strict_ar: bool = True,
     image_bytes: Optional[bytes] = None,
     image_mime: Optional[str] = None,
@@ -183,7 +201,7 @@ async def create_video_pair(
     """
     Создаёт два задания:
       1) «Оригинал» (обычно fast/720p),
-      2) «HQ» (медленнее, но лучше — 1080p, и МЫ ОТПРАВЛЯЕМ ЕГО И ДЛЯ 9:16).
+      2) «HQ» (медленнее, лучше — 1080p, работает и для 9:16).
     Возвращает (job_id_original, job_id_hq | None).
     """
     # 1) первый проход
@@ -195,6 +213,7 @@ async def create_video_pair(
         negative_prompt=negative_prompt,
         fast=fast,
         reference_file_id=reference_file_id,
+        reference_url=reference_url,      # прокинули
         image_bytes=image_bytes,
         image_mime=image_mime,
         seed=seed,
@@ -205,7 +224,7 @@ async def create_video_pair(
     if not send_hq:
         return job_id_first, None
 
-    # 2) HQ-проход — всегда с моделью качества и 1080п (вертикаль тоже поддерживается)
+    # 2) HQ-проход — 1080p, fast=False
     if isinstance(hq_resolution, int):
         hq_res_str = f"{hq_resolution}p"
     else:
@@ -213,28 +232,38 @@ async def create_video_pair(
         if not hq_res_str.endswith("p"):
             hq_res_str += "p"
 
+    extras_hq: dict = {}
+    if reference_file_id:
+        extras_hq["reference_file_id"] = reference_file_id
+    if reference_url:
+        extras_hq["reference_url"] = reference_url
+    extras_hq["model"] = "veo3"  # подсказка провайдеру на quality-модель
+
     params_hq = GenerationParams(
         prompt=prompt.strip(),
         provider=Provider.VEO3,
-        aspect_ratio=aspect_ratio,          # тот же AR, 9:16 тоже идёт в HQ
-        resolution=hq_res_str,              # 1080p
+        aspect_ratio=aspect_ratio,
+        resolution=hq_res_str,
         negative_prompt=negative_prompt,
-        fast_mode=False,                    # выключаем fast
+        fast_mode=False,
         image_bytes=image_bytes,
         image_mime=image_mime,
         seed=seed,
         duration_seconds=duration_seconds,
         strict_ar=strict_ar,
-        extras={
-            **({"reference_file_id": reference_file_id} if reference_file_id else {}),
-            "model": "veo3",                # quality-модель (для провайдера Polza)
-        },
+        extras=extras_hq,
     )
+
+    # Опционально — если у GenerationParams есть поле model/image_url.
     try:
-        # если в твоём GenerationParams есть поле model — проставим напрямую
         setattr(params_hq, "model", "veo3")
     except Exception:
         pass
+    if reference_url and getattr(params_hq, "image_url", None) in (None, ""):
+        try:
+            setattr(params_hq, "image_url", reference_url)
+        except Exception:
+            pass
 
     provider = get_provider(Provider.VEO3)
     job_id_hq = await provider.create_job(params_hq)
@@ -300,6 +329,7 @@ async def generate_wait_download_normalized(
     negative_prompt: Optional[str] = None,
     fast: bool = False,
     reference_file_id: Optional[str] = None,
+    reference_url: Optional[str] = None,    # ← добавлено
     image_bytes: Optional[bytes] = None,
     image_mime: Optional[str] = None,
     seed: Optional[int] = None,
@@ -319,6 +349,7 @@ async def generate_wait_download_normalized(
         negative_prompt=negative_prompt,
         fast=fast,
         reference_file_id=reference_file_id,
+        reference_url=reference_url,       # прокинули
         image_bytes=image_bytes,
         image_mime=image_mime,
         seed=seed,
@@ -333,7 +364,7 @@ async def generate_wait_download_normalized(
     return await download_and_normalize_video("veo3", job_id, aspect_ratio)
 
 
-# --------- НОВОЕ: “Оригинал + HQ” полноциклово ----------
+# --------- «Оригинал + HQ» полноциклово ----------
 async def generate_wait_download_normalized_pair(
     *,
     prompt: str,
@@ -347,6 +378,7 @@ async def generate_wait_download_normalized_pair(
     # общее:
     negative_prompt: Optional[str] = None,
     reference_file_id: Optional[str] = None,
+    reference_url: Optional[str] = None,     # ← добавлено
     image_bytes: Optional[bytes] = None,
     image_mime: Optional[str] = None,
     seed: Optional[int] = None,
@@ -369,6 +401,7 @@ async def generate_wait_download_normalized_pair(
         hq_resolution=hq_resolution,
         negative_prompt=negative_prompt,
         reference_file_id=reference_file_id,
+        reference_url=reference_url,       # прокинули
         image_bytes=image_bytes,
         image_mime=image_mime,
         seed=seed,

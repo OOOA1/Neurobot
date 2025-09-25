@@ -433,8 +433,8 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
             return
 
         # Если промпт пустой, но есть фото — подставим безопасный дефолт,
-        # чтобы Polza не вернула 400 и точно сделала photo->video.
-        used_prompt = prompt or "Animate this image realistically with native audio; keep the subject and style consistent."
+        # чтобы провайдер гарантированно пошёл в image→video.
+        used_prompt = prompt or "Animate this image realistically; keep the subject and style consistent."
 
         resolution_first = 1080  # 1080p
         reference_file_id = data.get("reference_file_id")
@@ -469,7 +469,6 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
         status_message = await message.answer("Генерация началась")
 
         try:
-            ref_value = (reference_url or reference_file_id) or None
             image_bytes: Optional[bytes] = data.get("image_bytes")
             image_mime: Optional[str] = data.get("image_mime")
             if (not image_bytes) and reference_url:
@@ -486,7 +485,8 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 resolution=resolution_first,
                 negative_prompt=negative_prompt,
                 fast=(mode == "fast"),
-                reference_file_id=ref_value,
+                reference_file_id=reference_file_id,  # ← отдельно
+                reference_url=reference_url,          # ← отдельно
                 strict_ar=strict,
                 image_bytes=image_bytes,
                 image_mime=image_mime,
@@ -582,6 +582,12 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
 
         try:
             # Второй проход: форсируем качественную модель 'veo3' и 1080p
+            extras_hq: dict[str, Any] = {}
+            if reference_file_id:
+                extras_hq["reference_file_id"] = reference_file_id
+            if reference_url:
+                extras_hq["reference_url"] = reference_url
+
             params_hq = GenerationParams(
                 prompt=used_prompt,
                 provider=Provider.VEO3,
@@ -592,9 +598,16 @@ async def veo_callback(cb: CallbackQuery, state: FSMContext) -> None:
                 image_bytes=data.get("image_bytes"),
                 image_mime=data.get("image_mime"),
                 strict_ar=True,
-                extras={**({"reference_file_id": (reference_url or reference_file_id)} if (reference_url or reference_file_id) else {})},
-                model="veo3",                # качественная модель
+                extras=extras_hq,
+                model="veo3",                 # качественная модель
             )
+            # Мягко проставим image_url, если это поле у модели есть
+            if reference_url and getattr(params_hq, "image_url", None) in (None, ""):
+                try:
+                    setattr(params_hq, "image_url", reference_url)
+                except Exception:
+                    pass
+
             job_id_hq = await generation_service.create_job(params_hq)
         except Exception as exc:
             log.exception("Veo3 submit (HQ) failed: %s", exc)
